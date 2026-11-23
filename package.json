@@ -1,0 +1,38 @@
+{
+  "name": "zook",
+  "version": "0.1.0",
+  "description": "A search app with an in-app browser",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "start": "electron-vite preview",
+    "dist": "electron-vite build && electron-builder"
+  },
+  "build": {
+    "appId": "app.zook",
+    "productName": "Zook",
+    "files": [
+      "out/**"
+    ],
+    "linux": {
+      "target": [
+        "AppImage"
+      ]
+    }
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
+    "electron": "^45.4.1",
+    "electron-builder": "^26.18.0",
+    "electron-vite": "^6.0.0",
+    "svelte": "^5.59.1",
+    "vite": "^8.3.8"
+  },
+  "allowScripts": {
+    "electron@45.4.1": true
+  },
+  "dependencies": {
+    "@ghostery/adblocker-electron": "^2.20.3"
+  }
+}
