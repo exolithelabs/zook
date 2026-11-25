@@ -7,6 +7,13 @@
   --link: #1a0dab;
   --accent: #4f46e5;
   --error: #c5221f;
+  --ok: #188038;
+  /* Boxes get a faint edge and a soft shadow rather than a hard outline; focus is a gentle ring. */
+  --box-border: color-mix(in srgb, var(--border) 55%, transparent);
+  --box-shadow: 0 1px 2px rgb(0 0 0 / 0.06), 0 1px 4px rgb(0 0 0 / 0.04);
+  --box-shadow-raised: 0 2px 6px rgb(0 0 0 / 0.08), 0 1px 2px rgb(0 0 0 / 0.05);
+  --focus-border: color-mix(in srgb, var(--accent) 45%, var(--border));
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent);
   color-scheme: light dark;
   font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
 }
@@ -20,9 +27,26 @@
     --link: #8ab4f8;
     --accent: #a5b4fc;
     --error: #f28b82;
+    --ok: #81c995;
   }
 }
 * { box-sizing: border-box; }
 html, body, #app { margin: 0; height: 100%; }
 body { background: var(--bg); color: var(--fg); }
 button { font: inherit; color: inherit; }
+
+/* Keyboard focus is visible everywhere; mouse clicks don't leave rings behind. */
+button:focus-visible, select:focus-visible, a:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  outline-offset: 2px;
+}
+/* Thin scrollbars in the theme's own colours, instead of the heavy platform default. */
+:root { scrollbar-color: var(--border) transparent; }
+* { scrollbar-width: thin; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

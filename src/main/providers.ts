@@ -6,7 +6,14 @@ export type SearchResult = {
   snippet: string
   favicon?: string
   age?: string
+  // Image and video verticals.
+  imageUrl?: string
+  thumbnailUrl?: string
+  source?: string
+  duration?: string
 }
+
+export type Vertical = 'web' | 'news' | 'images' | 'videos'
 
 export type SearchResponse = { results: SearchResult[]; hasMore: boolean }
 
@@ -29,12 +36,17 @@ export type ProviderInfo = {
   fields: ProviderField[]
   paginated: boolean
   note?: string
+  supports: Vertical[]
 }
 
 type Credentials = Record<string, string>
 
-type Provider = ProviderInfo & {
-  search: (creds: Credentials, query: string, page: number) => Promise<SearchResponse>
+type SearchFn = (creds: Credentials, query: string, page: number) => Promise<SearchResponse>
+
+type Provider = Omit<ProviderInfo, 'supports'> & {
+  search: SearchFn
+  // Searches beyond web; a provider only offers the verticals listed here.
+  verticals?: Partial<Record<Exclude<Vertical, 'web'>, SearchFn>>
 }
 
 const PAGE_SIZE = 10
@@ -101,6 +113,26 @@ export async function request(name: string, url: string, init?: RequestInit): Pr
   throw new Error(`${name} search failed (${res.status})${detail ? `: ${detail}` : ''}`)
 }
 
+function braveRequest(creds: Credentials, vertical: Vertical, params: Record<string, string>): Promise<any> {
+  return request('Brave Search', `https://api.search.brave.com/res/v1/${vertical}/search?${new URLSearchParams(params)}`, {
+    headers: { Accept: 'application/json', 'X-Subscription-Token': creds.apiKey }
+  })
+}
+
+function braveDisplayUrl(r: any): string {
+  return r.meta_url?.hostname ? `${r.meta_url.hostname}${r.meta_url.path ?? ''}` : r.url
+}
+
+async function serpapiRequest(creds: Credentials, params: Record<string, string>, resultsKey: string): Promise<any> {
+  const data = await request('SerpAPI', `https://serpapi.com/search.json?${new URLSearchParams({ ...params, api_key: creds.apiKey })}`)
+  if (data.error && !data[resultsKey]) {
+    // SerpAPI reports "no results" as an error string on a 200 response.
+    if (/hasn't returned any results/i.test(data.error)) return {}
+    throw new Error(`SerpAPI: ${data.error}`)
+  }
+  return data
+}
+
 const providers: Provider[] = [
   {
     id: 'brave',
@@ -110,20 +142,65 @@ const providers: Provider[] = [
     fields: [{ id: 'apiKey', label: 'API key', secret: true, env: 'BRAVE_API_KEY' }],
     paginated: true,
     async search(creds, query, page) {
-      const params = new URLSearchParams({ q: query, count: String(PAGE_SIZE), offset: String(page) })
-      const data = await request('Brave Search', `https://api.search.brave.com/res/v1/web/search?${params}`, {
-        headers: { Accept: 'application/json', 'X-Subscription-Token': creds.apiKey }
-      })
+      const data = await braveRequest(creds, 'web', { q: query, count: String(PAGE_SIZE), offset: String(page) })
       return {
         results: (data.web?.results ?? []).map((r: any) => ({
           title: stripTags(r.title ?? ''),
           url: r.url,
-          displayUrl: r.meta_url?.hostname ? `${r.meta_url.hostname}${r.meta_url.path ?? ''}` : r.url,
+          displayUrl: braveDisplayUrl(r),
           snippet: sanitizeHighlighted(r.description ?? ''),
           favicon: r.meta_url?.favicon,
           age: r.age
         })),
         hasMore: Boolean(data.query?.more_results_available) && page < MAX_PAGE
+      }
+    },
+    verticals: {
+      async news(creds, query, page) {
+        const data = await braveRequest(creds, 'news', { q: query, count: String(PAGE_SIZE), offset: String(page) })
+        return {
+          results: (data.results ?? []).map((r: any) => ({
+            title: stripTags(r.title ?? ''),
+            url: r.url,
+            displayUrl: braveDisplayUrl(r),
+            snippet: sanitizeHighlighted(r.description ?? ''),
+            favicon: r.meta_url?.favicon,
+            age: r.age,
+            thumbnailUrl: r.thumbnail?.src,
+            source: r.meta_url?.hostname
+          })),
+          hasMore: Boolean(data.query?.more_results_available) && page < MAX_PAGE
+        }
+      },
+      // The images endpoint has no offset, so it returns one larger page.
+      async images(creds, query) {
+        const data = await braveRequest(creds, 'images', { q: query, count: '50' })
+        return {
+          results: (data.results ?? []).map((r: any) => ({
+            ...plainResult({ title: stripTags(r.title ?? ''), url: r.url }),
+            imageUrl: r.properties?.url,
+            thumbnailUrl: r.thumbnail?.src,
+            source: r.source ?? r.meta_url?.hostname
+          })),
+          hasMore: false
+        }
+      },
+      async videos(creds, query, page) {
+        const data = await braveRequest(creds, 'videos', { q: query, count: String(PAGE_SIZE), offset: String(page) })
+        return {
+          results: (data.results ?? []).map((r: any) => ({
+            title: stripTags(r.title ?? ''),
+            url: r.url,
+            displayUrl: braveDisplayUrl(r),
+            snippet: sanitizeHighlighted(r.description ?? ''),
+            favicon: r.meta_url?.favicon,
+            age: r.age,
+            thumbnailUrl: r.thumbnail?.src,
+            source: r.video?.publisher ?? r.video?.creator ?? r.meta_url?.hostname,
+            duration: r.video?.duration
+          })),
+          hasMore: Boolean(data.query?.more_results_available) && page < MAX_PAGE
+        }
       }
     }
   },
@@ -135,25 +212,66 @@ const providers: Provider[] = [
     fields: [{ id: 'apiKey', label: 'API key', secret: true, env: 'SERPAPI_API_KEY' }],
     paginated: true,
     async search(creds, query, page) {
-      const params = new URLSearchParams({
-        engine: 'google',
-        q: query,
-        api_key: creds.apiKey,
-        num: String(PAGE_SIZE),
-        start: String(page * PAGE_SIZE)
-      })
-      const data = await request('SerpAPI', `https://serpapi.com/search.json?${params}`)
-      if (data.error && !data.organic_results) {
-        // SerpAPI reports "no results" as an error string on a 200 response.
-        if (/hasn't returned any results/i.test(data.error)) return { results: [], hasMore: false }
-        throw new Error(`SerpAPI: ${data.error}`)
-      }
+      const data = await serpapiRequest(
+        creds,
+        { engine: 'google', q: query, num: String(PAGE_SIZE), start: String(page * PAGE_SIZE) },
+        'organic_results'
+      )
       return {
         results: (data.organic_results ?? []).map((r: any) => ({
           ...plainResult({ title: r.title, url: r.link, text: r.snippet, favicon: r.favicon, age: r.date }),
           displayUrl: r.displayed_link ?? displayUrl(r.link)
         })),
         hasMore: Boolean(data.serpapi_pagination?.next) && page < MAX_PAGE
+      }
+    },
+    verticals: {
+      // Google News returns every result in one response.
+      async news(creds, query) {
+        const data = await serpapiRequest(creds, { engine: 'google_news', q: query }, 'news_results')
+        // Story clusters carry their lead article in `highlight` instead of a link of their own.
+        const seen = new Set<string>()
+        const items = (data.news_results ?? [])
+          .map((r: any) => (r.link ? r : r.highlight))
+          .filter((r: any) => r?.link && !seen.has(r.link) && seen.add(r.link))
+        return {
+          results: items.map((r: any) => ({
+            ...plainResult({ title: r.title, url: r.link, text: r.snippet, favicon: r.source?.icon }),
+            thumbnailUrl: r.thumbnail,
+            source: r.source?.name,
+            age: r.iso_date ? r.iso_date.slice(0, 10) : r.date
+          })),
+          hasMore: false
+        }
+      },
+      async images(creds, query, page) {
+        const data = await serpapiRequest(creds, { engine: 'google_images', q: query, ijn: String(page) }, 'images_results')
+        return {
+          results: (data.images_results ?? []).map((r: any) => ({
+            ...plainResult({ title: r.title, url: r.link }),
+            imageUrl: r.original,
+            thumbnailUrl: r.thumbnail,
+            source: r.source
+          })),
+          hasMore: Boolean(data.serpapi_pagination?.next) && page < MAX_PAGE
+        }
+      },
+      async videos(creds, query, page) {
+        const data = await serpapiRequest(
+          creds,
+          { engine: 'google_videos', q: query, start: String(page * PAGE_SIZE) },
+          'video_results'
+        )
+        return {
+          results: (data.video_results ?? []).map((r: any) => ({
+            ...plainResult({ title: r.title, url: r.link, text: r.snippet, age: r.date }),
+            displayUrl: r.displayed_link ?? displayUrl(r.link),
+            thumbnailUrl: r.thumbnail?.static ?? r.thumbnail,
+            source: r.source ?? r.channel?.name,
+            duration: r.duration
+          })),
+          hasMore: Boolean(data.serpapi_pagination?.next) && page < MAX_PAGE
+        }
       }
     }
   },
@@ -183,6 +301,28 @@ const providers: Provider[] = [
           displayUrl: r.displayLink ? `${r.displayLink}${new URL(r.link).pathname.replace(/\/$/, '')}` : displayUrl(r.link)
         })),
         hasMore: Boolean(data.queries?.nextPage) && page < MAX_PAGE
+      }
+    },
+    verticals: {
+      async images(creds, query, page) {
+        const params = new URLSearchParams({
+          key: creds.apiKey,
+          cx: creds.cx,
+          q: query,
+          searchType: 'image',
+          num: String(PAGE_SIZE),
+          start: String(page * PAGE_SIZE + 1)
+        })
+        const data = await request('Google', `https://www.googleapis.com/customsearch/v1?${params}`)
+        return {
+          results: (data.items ?? []).map((r: any) => ({
+            ...plainResult({ title: r.title, url: r.image?.contextLink ?? r.link }),
+            imageUrl: r.link,
+            thumbnailUrl: r.image?.thumbnailLink,
+            source: r.displayLink
+          })),
+          hasMore: Boolean(data.queries?.nextPage) && page < MAX_PAGE
+        }
       }
     }
   },
@@ -281,5 +421,14 @@ export function getProvider(id: ProviderId): Provider {
 }
 
 export function providerInfo(): ProviderInfo[] {
-  return providers.map(({ search: _search, ...info }) => info)
+  return providers.map(({ search: _search, verticals, ...info }) => ({
+    ...info,
+    supports: ['web', ...(Object.keys(verticals ?? {}) as Vertical[])]
+  }))
+}
+
+export function verticalSearch(provider: Provider, vertical: Vertical): SearchFn {
+  const fn = vertical === 'web' ? provider.search : provider.verticals?.[vertical]
+  if (!fn) throw new Error(`${provider.name} doesn't support ${vertical} search.`)
+  return fn
 }

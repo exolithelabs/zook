@@ -28,13 +28,18 @@ function loadBlocker(): Promise<ElectronBlocker> {
   return blocker
 }
 
+// The engine's emitter can only unsubscribe a listener by reference.
+let blockedListener: ((request: { tabId: number }) => void) | null = null
+
 export async function setAdblock(session: Session, enabled: boolean, onBlocked: (webContentsId: number) => void) {
   const engine = await loadBlocker()
   if (enabled && !engine.isBlockingEnabled(session)) {
     engine.enableBlockingInSession(session)
-    engine.on('request-blocked', (request) => onBlocked(request.tabId))
+    blockedListener = (request) => onBlocked(request.tabId)
+    engine.on('request-blocked', blockedListener)
   } else if (!enabled && engine.isBlockingEnabled(session)) {
     engine.disableBlockingInSession(session)
-    engine.removeAllListeners('request-blocked')
+    if (blockedListener) engine.unsubscribe('request-blocked', blockedListener)
+    blockedListener = null
   }
 }

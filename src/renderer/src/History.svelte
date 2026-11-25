@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Icon from './Icon.svelte'
   import type { History } from '../../main/history'
 
   let {
@@ -8,7 +9,7 @@
   }: {
     onclose: () => void
     onsearch: (query: string) => void
-    onopen: (url: string, background: boolean) => void
+    onopen: (url: string) => void
   } = $props()
 
   let history = $state<History>({ searches: [], visits: [] })
@@ -70,7 +71,7 @@
   <div class="panel" role="dialog" aria-modal="true" aria-labelledby="history-title">
     <header>
       <h2 id="history-title">History</h2>
-      <button class="close" onclick={onclose} aria-label="Close">✕</button>
+      <button class="close" onclick={onclose} aria-label="Close"><Icon name="close" /></button>
     </header>
 
     <div class="controls">
@@ -91,16 +92,11 @@
         {#each visits as v (v.url)}
           <li>
             <span class="time">{when(v.at)}</span>
-            <button
-              class="entry"
-              title={v.url}
-              onclick={(e) => onopen(v.url, e.ctrlKey || e.metaKey)}
-              onauxclick={(e) => e.button === 1 && onopen(v.url, true)}
-            >
+            <button class="entry" title={v.url} onclick={() => onopen(v.url)}>
               <span class="title">{v.title || v.url}</span>
               <span class="host">{host(v.url)}</span>
             </button>
-            <button class="remove" onclick={() => removeVisit(v.url)} aria-label="Remove" title="Remove">✕</button>
+            <button class="remove" onclick={() => removeVisit(v.url)} aria-label="Remove" title="Remove"><Icon name="close" /></button>
           </li>
         {:else}
           <li class="empty">{q ? 'No matching pages.' : 'No pages visited yet.'}</li>
@@ -110,9 +106,9 @@
           <li>
             <span class="time">{when(s.at)}</span>
             <button class="entry" onclick={() => onsearch(s.query)}>
-              <span class="title">⌕ {s.query}</span>
+              <span class="title"><Icon name="search" /> {s.query}</span>
             </button>
-            <button class="remove" onclick={() => removeSearch(s.query)} aria-label="Remove" title="Remove">✕</button>
+            <button class="remove" onclick={() => removeSearch(s.query)} aria-label="Remove" title="Remove"><Icon name="close" /></button>
           </li>
         {:else}
           <li class="empty">{q ? 'No matching searches.' : 'No searches yet.'}</li>
@@ -154,32 +150,35 @@
     display: flex;
     flex-direction: column;
     background: var(--bg);
-    border: 1px solid var(--border);
+    border: 1px solid var(--box-border);
     border-radius: 12px;
     padding: 20px 24px 16px;
     box-shadow: 0 10px 40px rgb(0 0 0 / 0.3);
   }
   header { display: flex; align-items: center; justify-content: space-between; }
   h2 { margin: 0; font-size: 20px; }
-  .close { border: 0; background: none; font-size: 16px; cursor: pointer; color: var(--muted); }
+  .close { display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; border: 0; border-radius: 50%; background: none; cursor: pointer; color: var(--muted); }
+  .close:hover { background: var(--surface); color: var(--fg); }
   .controls { display: flex; gap: 12px; margin: 16px 0 8px; flex-wrap: wrap; }
-  .segmented { display: flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .segmented { display: flex; border: 1px solid var(--box-border); border-radius: 8px; box-shadow: var(--box-shadow); overflow: hidden; }
   .segmented button { border: 0; background: none; padding: 6px 14px; cursor: pointer; font-size: 13px; }
   .segmented button.on { background: var(--surface); font-weight: 600; }
   .count { color: var(--muted); font-weight: 400; margin-left: 4px; }
   .filter {
     flex: 1;
     min-width: 160px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--box-border);
     border-radius: 8px;
     padding: 6px 12px;
     background: var(--bg);
+    box-shadow: var(--box-shadow);
     color: var(--fg);
     font: inherit;
     font-size: 14px;
     outline: 0;
+    transition: border-color 0.12s, box-shadow 0.12s;
   }
-  .filter:focus { border-color: var(--accent); }
+  .filter:focus { border-color: var(--focus-border); box-shadow: var(--focus-ring); }
   .list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
   .list li { display: flex; align-items: center; gap: 12px; padding: 2px 0; border-radius: 8px; }
   .list li:hover { background: var(--surface); }
@@ -199,12 +198,13 @@
   }
   .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .host { color: var(--muted); font-size: 12px; white-space: nowrap; }
-  .remove { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 4px 10px; opacity: 0; }
+  .remove { display: inline-flex; align-items: center; border: 0; background: none; color: var(--muted); cursor: pointer; padding: 4px 10px; opacity: 0; }
+  .remove:hover { color: var(--fg); }
   .list li:hover .remove { opacity: 1; }
   .empty { justify-content: center; color: var(--muted); padding: 32px 0 !important; font-size: 14px; }
   .empty:hover { background: none !important; }
-  footer { display: flex; justify-content: flex-end; align-items: center; gap: 8px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 13px; }
-  .ghost { border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+  footer { display: flex; justify-content: flex-end; align-items: center; gap: 8px; padding-top: 12px; border-top: 1px solid var(--box-border); font-size: 13px; }
+  .ghost { border: 1px solid var(--box-border); box-shadow: var(--box-shadow); background: var(--surface); border-radius: 8px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
   .ghost:disabled { opacity: 0.5; cursor: default; }
   .danger { color: var(--error); }
   .muted { color: var(--muted); }

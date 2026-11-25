@@ -1,6 +1,15 @@
 import { app, safeStorage } from 'electron'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import {
+  chatPresets,
+  getChatPreset,
+  normalizeBaseUrl,
+  presetForUrl,
+  type ChatConfig,
+  type ChatPreset,
+  type ChatPresetId
+} from './chat'
 import { getProvider, providerIds, providerInfo, type ProviderId, type ProviderInfo } from './providers'
 
 type StoredSecret = { data: string; encrypted: boolean }
@@ -9,8 +18,14 @@ type StoredSettings = {
   // Each provider's fields, stored as one JSON string (encrypted when possible).
   credentials?: Partial<Record<ProviderId, StoredSecret>>
   adblock?: boolean
+  // Whether the chat sidebar was last left open.
+  sidebarOpen?: boolean
+  // Whether new AI chats search the web before answering. Kept apart from `chat`, which is cleared with the backend.
+  chatGrounded?: boolean
   // Optional Brave Autosuggest key for online search suggestions.
   suggestKey?: StoredSecret
+  // AI chat backend. Only the API key is secret. `preset` may name one that no longer exists.
+  chat?: { preset: string; baseUrl: string; model: string; apiKey?: StoredSecret }
   // Written by the first version, which only supported Brave.
   braveApiKey?: StoredSecret
 }
@@ -28,7 +43,19 @@ export type SettingsStatus = {
   canEncrypt: boolean
   providers: ProviderStatus[]
   adblock: boolean
+  sidebarOpen: boolean
   suggest: { source: 'settings' | 'env' | 'none'; hint: string }
+  chat: {
+    source: 'settings' | 'env' | 'none'
+    preset: ChatPresetId
+    name: string
+    baseUrl: string
+    model: string
+    hint: string
+    presets: ChatPreset[]
+    // Search the web first and cite the results, when a search provider is set up.
+    grounded: boolean
+  }
 }
 
 const settingsPath = () => join(app.getPath('userData'), 'settings.json')
@@ -144,6 +171,18 @@ export function setAdblock(enabled: boolean) {
   writeSettings(settings)
 }
 
+export function setChatGrounded(grounded: boolean) {
+  const settings = readSettings()
+  settings.chatGrounded = grounded
+  writeSettings(settings)
+}
+
+export function setSidebarOpen(open: boolean) {
+  const settings = readSettings()
+  settings.sidebarOpen = open
+  writeSettings(settings)
+}
+
 function savedSuggestKey(settings = readSettings()): string | undefined {
   return settings.suggestKey ? decrypt(settings.suggestKey) : undefined
 }
@@ -164,15 +203,99 @@ export function clearSuggestKey() {
   writeSettings(settings)
 }
 
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host
+  } catch {
+    return url
+  }
+}
+
+function savedChatConfig(settings = readSettings()): ChatConfig | undefined {
+  const chat = settings.chat
+  if (!chat?.baseUrl || !chat.model) return undefined
+  const apiKey = chat.apiKey ? decrypt(chat.apiKey) : undefined
+  return { preset: getChatPreset(chat.preset).id, baseUrl: chat.baseUrl, model: chat.model, apiKey }
+}
+
+function envChatConfig(): ChatConfig | undefined {
+  const baseUrl = normalizeBaseUrl(process.env.ZOOK_CHAT_BASE_URL ?? '')
+  if (!baseUrl) return undefined
+  const preset = presetForUrl(baseUrl)
+  const model = process.env.ZOOK_CHAT_MODEL?.trim() || getChatPreset(preset).model
+  if (!model) return undefined
+  return { preset, baseUrl, model, apiKey: process.env.ZOOK_CHAT_API_KEY?.trim() || undefined }
+}
+
+export function getChatConfig(): ChatConfig | undefined {
+  return savedChatConfig() ?? envChatConfig()
+}
+
+// A blank key keeps the saved one, but only for the same base URL, so a key is never
+// sent to a server it wasn't entered for.
+export function resolveChatConfig(preset: ChatPresetId, baseUrl: string, model: string, apiKey: string): ChatConfig {
+  baseUrl = normalizeBaseUrl(baseUrl)
+  model = model.trim()
+  apiKey = apiKey.trim()
+  if (!/^https?:\/\/[^/]/i.test(baseUrl)) throw new Error('Enter a base URL starting with http:// or https://.')
+  if (!model) throw new Error('Enter a model.')
+  const key = chatKeyFor(baseUrl, apiKey)
+  if (!key && getChatPreset(preset).needsKey) throw new Error('Enter the API key.')
+  return { preset: getChatPreset(preset).id, baseUrl, model, apiKey: key }
+}
+
+// Enough of a config to list models with: no model is needed, and the same key rule applies.
+export function resolveChatListConfig(preset: ChatPresetId, baseUrl: string, apiKey: string): ChatConfig {
+  baseUrl = normalizeBaseUrl(baseUrl)
+  if (!/^https?:\/\/[^/]/i.test(baseUrl)) throw new Error('Enter a base URL starting with http:// or https://.')
+  return { preset: getChatPreset(preset).id, baseUrl, model: '', apiKey: chatKeyFor(baseUrl, apiKey.trim()) }
+}
+
+function chatKeyFor(baseUrl: string, apiKey: string): string | undefined {
+  const saved = savedChatConfig()
+  return apiKey || (saved?.baseUrl === baseUrl ? saved.apiKey : undefined)
+}
+
+export function saveChatConfig(config: ChatConfig) {
+  const settings = readSettings()
+  settings.chat = {
+    preset: config.preset,
+    baseUrl: config.baseUrl,
+    model: config.model,
+    apiKey: config.apiKey ? encrypt(config.apiKey) : undefined
+  }
+  writeSettings(settings)
+}
+
+export function clearChatConfig() {
+  const settings = readSettings()
+  delete settings.chat
+  writeSettings(settings)
+}
+
 export function getStatus(): SettingsStatus {
   const settings = readSettings()
   const suggestSaved = savedSuggestKey(settings)
   const suggestKey = suggestSaved || process.env.BRAVE_SUGGEST_API_KEY
+  const chatSaved = savedChatConfig(settings)
+  const chat = chatSaved ?? envChatConfig()
+  const chatPreset = getChatPreset(chat?.preset ?? 'openai')
   return {
     adblock: settings.adblock ?? true,
+    sidebarOpen: settings.sidebarOpen ?? true,
     suggest: {
       source: suggestSaved ? 'settings' : suggestKey ? 'env' : 'none',
       hint: suggestKey ? `••••${suggestKey.slice(-4)}` : ''
+    },
+    chat: {
+      source: chatSaved ? 'settings' : chat ? 'env' : 'none',
+      preset: chatPreset.id,
+      name: chatPreset.id === 'custom' && chat ? hostOf(chat.baseUrl) : chatPreset.name,
+      baseUrl: chat?.baseUrl ?? '',
+      model: chat?.model ?? '',
+      hint: chat?.apiKey ? `••••${chat.apiKey.slice(-4)}` : '',
+      presets: chatPresets,
+      grounded: settings.chatGrounded ?? true
     },
     active: getActiveProvider(),
     canEncrypt: canEncrypt(),

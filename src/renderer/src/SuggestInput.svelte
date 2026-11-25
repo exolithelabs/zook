@@ -5,6 +5,7 @@
 </script>
 
 <script lang="ts">
+  import Icon from './Icon.svelte'
   let {
     value = $bindable(''),
     id,
@@ -165,7 +166,7 @@
           }}
           onmouseenter={() => (highlighted = i)}
         >
-          <span class="icon" aria-hidden="true">{s.kind === 'history' ? '🕘' : s.kind === 'page' ? '🌐' : '⌕'}</span>
+          <span class="icon"><Icon name={s.kind === 'history' ? 'history' : s.kind === 'page' ? 'globe' : 'search'} /></span>
           <span class="text">{s.text}</span>
           {#if s.kind === 'page'}<span class="url">{s.url.replace(/^https?:\/\/(www\.)?/, '')}</span>{/if}
           {#if s.kind === 'history'}
@@ -174,7 +175,7 @@
               class="remove"
               title="Remove from history (Shift+Delete)"
               aria-label="Remove from history"
-              onmousedown={(e) => removeHistory(e, s)}>✕</button
+              onmousedown={(e) => removeHistory(e, s)}><Icon name="close" /></button
             >
           {/if}
         </li>
@@ -203,9 +204,9 @@
     padding: 6px 0;
     list-style: none;
     background: var(--bg);
-    border: 1px solid var(--border);
+    border: 1px solid var(--box-border);
     border-radius: 12px;
-    box-shadow: 0 8px 24px rgb(0 0 0 / 0.18);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 0.12), 0 1px 3px rgb(0 0 0 / 0.06);
     z-index: 20;
     font-size: 14px;
   }
@@ -217,7 +218,7 @@
     cursor: pointer;
   }
   li.highlighted { background: var(--surface); }
-  .icon { width: 18px; text-align: center; color: var(--muted); font-size: 13px; }
+  .icon { display: flex; justify-content: center; width: 18px; flex-shrink: 0; color: var(--muted); }
   .text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .url {
     color: var(--link);
@@ -229,6 +230,8 @@
     min-width: 0;
   }
   .remove {
+    display: inline-flex;
+    align-items: center;
     margin-left: auto;
     border: 0;
     background: none;
