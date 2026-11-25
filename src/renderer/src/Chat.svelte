@@ -2,7 +2,7 @@
   import { untrack } from 'svelte'
   import Icon, { iconSvg } from './Icon.svelte'
   import type { SettingsStatus } from '../../main/settings'
-  import { chats, groundedFor, type ChatThread } from './chat.svelte'
+  import { chats, groundedFor, type ChatThread } from './chats.svelte'
   import { renderMarkdown } from './markdown'
 
   let {

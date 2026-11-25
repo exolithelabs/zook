@@ -10,7 +10,7 @@
   import Sidebar from './Sidebar.svelte'
   import SuggestInput, { type Suggestion } from './SuggestInput.svelte'
   import UpdateBanner from './UpdateBanner.svelte'
-  import { chats, groundedFor } from './chat.svelte'
+  import { chats, groundedFor } from './chats.svelte'
   import { errorMessage } from './errors'
   import { updates } from './updates.svelte'
   import { view } from './view.svelte'

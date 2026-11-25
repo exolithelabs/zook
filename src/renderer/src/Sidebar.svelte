@@ -1,7 +1,7 @@
 <script lang="ts">
   import Icon from './Icon.svelte'
   import type { ThreadSummary } from '../../main/threads'
-  import { chats } from './chat.svelte'
+  import { chats } from './chats.svelte'
 
   let {
     activeId,
