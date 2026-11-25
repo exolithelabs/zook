@@ -10,6 +10,7 @@
 // any package whose code Vite bundled into out/ (such as the Svelte runtime). The `bundledPackages`
 // plugin below records the latter while building.
 
+import { spawnSync } from 'node:child_process'
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -137,11 +138,37 @@ function licenseText(dir) {
   return files.map((f) => readFileSync(join(dir, f), 'utf8').replace(/\r\n/g, '\n').trim()).join('\n\n')
 }
 
+// Electron 45 no longer downloads its binary from a postinstall script. The license files
+// licenses.mjs copies live inside that binary distribution, so fetch it when it is missing.
+function ensureElectronDist(electronDir, version) {
+  const versionFile = join(electronDir, 'dist', 'version')
+  const license = join(electronDir, 'dist', 'LICENSE')
+  const chromium = join(electronDir, 'dist', 'LICENSES.chromium.html')
+  try {
+    if (
+      existsSync(license) &&
+      existsSync(chromium) &&
+      readFileSync(versionFile, 'utf8').replace(/^v/, '').trim() === version
+    ) {
+      return
+    }
+  } catch {
+    // dist/ is absent until the installer runs.
+  }
+  // install.js does nothing when the executable is already present, even if the license
+  // files beside it are gone. Drop the version marker so it extracts them again.
+  rmSync(versionFile, { force: true })
+  console.log(`licenses: downloading Electron ${version}`)
+  const result = spawnSync(process.execPath, [join(electronDir, 'install.js')], { stdio: 'inherit' })
+  if (result.status !== 0) throw new Error(`Electron ${version} failed to download, so its license files are missing`)
+}
+
 function main() {
   const app = readJson(join(root, 'package.json'))
   const electronDir = resolvePackage('electron', root)
   if (!electronDir) throw new Error('electron is not installed')
   const electron = readJson(join(electronDir, 'package.json'))
+  ensureElectronDist(electronDir, electron.version)
 
   const dirs = new Set([...productionPackages(), ...bundledPackageDirs()])
   const byId = new Map()
