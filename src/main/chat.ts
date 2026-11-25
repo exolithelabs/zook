@@ -120,7 +120,7 @@ export const chatPresets: ChatPreset[] = [
     baseUrl: '',
     model: '',
     needsKey: false,
-    note: 'Any OpenAI-compatible endpoint.'
+    note: 'Any endpoint that speaks one of the APIs below.'
   }
 ]
 
@@ -142,23 +142,71 @@ export function normalizeBaseUrl(url: string): string {
   return url.trim().replace(/\/+$/, '').replace(/\/chat\/completions$/, '')
 }
 
-export type ChatConfig = { preset: ChatPresetId; baseUrl: string; model: string; apiKey?: string }
+export const chatProtocols: { id: ChatProtocol; name: string }[] = [
+  { id: 'openai', name: 'OpenAI-compatible' },
+  { id: 'anthropic', name: 'Anthropic Messages' },
+  { id: 'gemini', name: 'Google Gemini' }
+]
+
+export function isChatProtocol(value: unknown): value is ChatProtocol {
+  return chatProtocols.some((p) => p.id === value)
+}
+
+// `protocol` follows the preset for built-in backends; a custom one picks its own. `name` is
+// what a custom backend was called.
+export type ChatConfig = {
+  preset: ChatPresetId
+  protocol: ChatProtocol
+  baseUrl: string
+  model: string
+  apiKey?: string
+  name?: string
+}
 
 export type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string }
 
-// Finish reasons use OpenAI's names whatever the protocol: stop, length, content_filter, ...
+// A tool the model may call, described with a JSON schema for its arguments.
+export type ChatTool = { name: string; description: string; parameters: Record<string, unknown> }
+
+export type ToolCall = { id: string; name: string; args: Record<string, unknown> }
+export type ToolResult = { id: string; name: string; content: string }
+
+// One step of a conversation with tools, in no particular protocol's shape. An assistant turn
+// that called tools keeps what the protocol needs echoed back: DeepSeek's reasoning and
+// Gemini's raw parts, which carry thought signatures.
+type AgentItem =
+  | ChatMessage
+  | { role: 'assistant'; content: string; calls: ToolCall[]; reasoning?: string; parts?: unknown[] }
+  | { role: 'tool'; results: ToolResult[] }
+
+// Finish reasons use OpenAI's names whatever the protocol: stop, length, content_filter, tool_calls, ...
 type StreamEvent = { text: string; finish?: string }
 
+// Collects the parts of one streamed turn that aren't visible text.
+type TurnState = {
+  // Tool calls by stream index, with their arguments still as JSON text.
+  calls: Map<number, { id: string; name: string; json: string }>
+  reasoning: string
+  parts: unknown[]
+}
+
 type Protocol = {
-  request(config: ChatConfig, messages: ChatMessage[]): { url: string; headers: Record<string, string>; body: unknown }
+  // `final` asks for an answer without further tool calls, while still describing the tools
+  // the history refers to.
+  request(
+    config: ChatConfig,
+    items: AgentItem[],
+    tools: ChatTool[],
+    final: boolean
+  ): { url: string; headers: Record<string, string>; body: unknown }
   // A cheap authenticated GET that checks the key without spending tokens.
   verify(config: ChatConfig): { url: string; headers: Record<string, string> }
   // The model list, and how to read chat model ids out of its response.
   models(config: ChatConfig): { url: string; headers: Record<string, string>; ids(body: any): string[] }
   // Whether a failed verify response means the setup is wrong (vs. an endpoint that doesn't exist).
   verifyFails(status: number): boolean
-  // Reads one SSE data payload; throws for error events.
-  parse(event: any): StreamEvent
+  // Reads one SSE data payload into the turn; throws for error events.
+  parse(event: any, turn: TurnState): StreamEvent
 }
 
 // Some backends (OpenCode Go) ask clients to name themselves rather than send a generic
@@ -173,6 +221,7 @@ const ANTHROPIC_MAX_TOKENS = 8192
 
 export function backendName(config: ChatConfig): string {
   if (config.preset !== 'custom') return getChatPreset(config.preset).name
+  if (config.name) return config.name
   try {
     return new URL(config.baseUrl).host
   } catch {
@@ -180,19 +229,28 @@ export function backendName(config: ChatConfig): string {
   }
 }
 
+type NativeTurn<Part> = { role: 'user' | 'assistant'; parts: Part[] }
+
 // Native APIs take the system prompt separately and want turns that alternate, starting
-// with the user. Consecutive turns from one side (e.g. around a failed reply) are merged.
-function splitSystem(messages: ChatMessage[]): { system: string; turns: { role: 'user' | 'assistant'; content: string }[] } {
-  const system = messages
-    .filter((m) => m.role === 'system')
+// with the user. Consecutive turns from one side (e.g. around a failed reply, or tool results
+// before a question) are merged.
+function splitSystem<Part>(
+  items: AgentItem[],
+  toParts: (item: Exclude<AgentItem, { role: 'system' }>) => Part[]
+): { system: string; turns: NativeTurn<Part>[] } {
+  const system = items
+    .filter((m): m is ChatMessage => m.role === 'system')
     .map((m) => m.content)
     .join('\n\n')
-  const turns: { role: 'user' | 'assistant'; content: string }[] = []
-  for (const m of messages) {
-    if (m.role === 'system' || (turns.length === 0 && m.role === 'assistant')) continue
+  const turns: NativeTurn<Part>[] = []
+  for (const item of items) {
+    if (item.role === 'system' || (turns.length === 0 && item.role === 'assistant')) continue
+    const role = item.role === 'tool' ? 'user' : item.role
+    const parts = toParts(item)
+    if (parts.length === 0) continue
     const last = turns.at(-1)
-    if (last?.role === m.role) last.content += `\n\n${m.content}`
-    else turns.push({ role: m.role, content: m.content })
+    if (last?.role === role) last.parts.push(...parts)
+    else turns.push({ role, parts })
   }
   return { system, turns }
 }
@@ -201,13 +259,65 @@ function geminiModelPath(config: ChatConfig): string {
   return `${config.baseUrl}/models/${encodeURIComponent(config.model.replace(/^models\//, ''))}`
 }
 
+function openaiMessages(items: AgentItem[]): unknown[] {
+  return items.flatMap((item): unknown[] => {
+    if (item.role === 'tool') {
+      return item.results.map((r) => ({ role: 'tool', tool_call_id: r.id, content: r.content }))
+    }
+    if (!('calls' in item)) return [item]
+    return [
+      {
+        role: 'assistant',
+        content: item.content || null,
+        tool_calls: item.calls.map((c) => ({
+          id: c.id,
+          type: 'function',
+          function: { name: c.name, arguments: JSON.stringify(c.args) }
+        })),
+        // DeepSeek's thinking mode wants its reasoning back while it's still using tools.
+        ...(item.reasoning && { reasoning_content: item.reasoning })
+      }
+    ]
+  })
+}
+
+function anthropicParts(item: Exclude<AgentItem, { role: 'system' }>): unknown[] {
+  if (item.role === 'tool') {
+    return item.results.map((r) => ({ type: 'tool_result', tool_use_id: r.id, content: r.content }))
+  }
+  // Empty text blocks are rejected.
+  const text = item.content.trim() ? [{ type: 'text', text: item.content }] : []
+  if (!('calls' in item)) return text
+  return [...text, ...item.calls.map((c) => ({ type: 'tool_use', id: c.id, name: c.name, input: c.args }))]
+}
+
+function geminiParts(item: Exclude<AgentItem, { role: 'system' }>): unknown[] {
+  if (item.role === 'tool') {
+    return item.results.map((r) => ({
+      functionResponse: { ...(!r.id.startsWith('zook_') && { id: r.id }), name: r.name, response: { content: r.content } }
+    }))
+  }
+  const text = item.content.trim() ? [{ text: item.content }] : []
+  if (!('calls' in item)) return text
+  // The model's own parts go back as they came, thought signatures and all.
+  return [...text, ...(item.parts ?? item.calls.map((c) => ({ functionCall: { name: c.name, args: c.args } })))]
+}
+
 const protocols: Record<ChatProtocol, Protocol> = {
   openai: {
-    request(config, messages) {
+    request(config, items, tools, final) {
       return {
         url: `${config.baseUrl}/chat/completions`,
         headers: openaiHeaders(config),
-        body: { model: config.model, messages, stream: true }
+        body: {
+          model: config.model,
+          messages: openaiMessages(items),
+          stream: true,
+          ...(tools.length && {
+            tools: tools.map((t) => ({ type: 'function', function: t })),
+            tool_choice: final ? 'none' : 'auto'
+          })
+        }
       }
     },
     verify(config) {
@@ -222,21 +332,44 @@ const protocols: Record<ChatProtocol, Protocol> = {
     },
     // Some compatible servers don't implement /models, so only auth failures count.
     verifyFails: () => false,
-    parse(event) {
+    parse(event, turn) {
       if (event.error) throw new Error(errorText(event.error))
       const choice = event.choices?.[0]
-      if (choice) return { text: choice.delta?.content ?? '', finish: choice.finish_reason ?? undefined }
-      return { text: '' }
+      if (!choice) return { text: '' }
+      const delta = choice.delta ?? {}
+      if (typeof delta.reasoning_content === 'string') turn.reasoning += delta.reasoning_content
+      for (const tc of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+        const key = typeof tc.index === 'number' ? tc.index : turn.calls.size
+        let call = turn.calls.get(key)
+        if (!call) turn.calls.set(key, (call = { id: '', name: '', json: '' }))
+        if (tc.id) call.id = tc.id
+        if (tc.function?.name) call.name ||= tc.function.name
+        const args = tc.function?.arguments
+        // Ollama sends arguments whole, as an object.
+        if (typeof args === 'string') call.json += args
+        else if (args && typeof args === 'object') call.json = JSON.stringify(args)
+      }
+      return { text: delta.content ?? '', finish: choice.finish_reason ?? undefined }
     }
   },
 
   anthropic: {
-    request(config, messages) {
-      const { system, turns } = splitSystem(messages)
+    request(config, items, tools, final) {
+      const { system, turns } = splitSystem(items, anthropicParts)
       return {
         url: `${config.baseUrl}/messages`,
         headers: anthropicHeaders(config),
-        body: { model: config.model, max_tokens: ANTHROPIC_MAX_TOKENS, system, messages: turns, stream: true }
+        body: {
+          model: config.model,
+          max_tokens: ANTHROPIC_MAX_TOKENS,
+          system,
+          messages: turns.map((t) => ({ role: t.role, content: t.parts })),
+          stream: true,
+          ...(tools.length && {
+            tools: tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters })),
+            tool_choice: { type: final ? 'none' : 'auto' }
+          })
+        }
       }
     },
     verify(config) {
@@ -251,36 +384,56 @@ const protocols: Record<ChatProtocol, Protocol> = {
     },
     // A 404 here means the model id is wrong.
     verifyFails: (status) => status === 404,
-    parse(event) {
+    parse(event, turn) {
       switch (event.type) {
-        case 'content_block_delta':
-          // Thinking and tool-input deltas aren't part of the visible reply.
+        case 'content_block_start':
+          if (event.content_block?.type === 'tool_use') {
+            turn.calls.set(event.index, { id: event.content_block.id ?? '', name: event.content_block.name ?? '', json: '' })
+          }
+          return { text: '' }
+        case 'content_block_delta': {
+          if (event.delta?.type === 'input_json_delta') {
+            const call = turn.calls.get(event.index)
+            if (call) call.json += event.delta.partial_json ?? ''
+          }
+          // Thinking deltas aren't part of the visible reply.
           return { text: event.delta?.type === 'text_delta' ? (event.delta.text ?? '') : '' }
+        }
         case 'message_delta': {
           const reason = event.delta?.stop_reason
           if (!reason) return { text: '' }
-          const finish: Record<string, string> = { end_turn: 'stop', stop_sequence: 'stop', max_tokens: 'length', refusal: 'content_filter' }
+          const finish: Record<string, string> = {
+            end_turn: 'stop',
+            stop_sequence: 'stop',
+            max_tokens: 'length',
+            refusal: 'content_filter',
+            tool_use: 'tool_calls'
+          }
           return { text: '', finish: finish[reason] ?? reason }
         }
         case 'error':
           if (event.error?.type === 'overloaded_error') throw new Error('Anthropic is overloaded right now. Try again shortly.')
           throw new Error(errorText(event.error))
         default:
-          // message_start, content_block_start/stop, message_stop, ping
+          // message_start, content_block_stop, message_stop, ping
           return { text: '' }
       }
     }
   },
 
   gemini: {
-    request(config, messages) {
-      const { system, turns } = splitSystem(messages)
+    request(config, items, tools, final) {
+      const { system, turns } = splitSystem(items, geminiParts)
       return {
         url: `${geminiModelPath(config)}:streamGenerateContent?alt=sse`,
         headers: geminiHeaders(config),
         body: {
           ...(system && { systemInstruction: { parts: [{ text: system }] } }),
-          contents: turns.map((t) => ({ role: t.role === 'assistant' ? 'model' : 'user', parts: [{ text: t.content }] }))
+          contents: turns.map((t) => ({ role: t.role === 'assistant' ? 'model' : 'user', parts: t.parts })),
+          ...(tools.length && {
+            tools: [{ functionDeclarations: tools }],
+            toolConfig: { functionCallingConfig: { mode: final ? 'NONE' : 'AUTO' } }
+          })
         }
       }
     },
@@ -298,15 +451,26 @@ const protocols: Record<ChatProtocol, Protocol> = {
             .map((m: any) => String(m?.name ?? '').replace(/^models\//, ''))
       }
     },
-    parse(event) {
+    parse(event, turn) {
       if (event.error) throw new Error(errorText(event.error))
       if (event.promptFeedback?.blockReason) {
         throw new Error(`Gemini blocked this prompt (${event.promptFeedback.blockReason}).`)
       }
       const candidate = event.candidates?.[0]
-      const text = (candidate?.content?.parts ?? [])
-        .filter((p: any) => !p.thought && typeof p.text === 'string')
-        .map((p: any) => p.text)
+      const parts: any[] = candidate?.content?.parts ?? []
+      for (const part of parts) {
+        if (!part.functionCall) continue
+        // Calls arrive whole, one part each.
+        turn.calls.set(turn.calls.size, {
+          id: typeof part.functionCall.id === 'string' ? part.functionCall.id : '',
+          name: part.functionCall.name ?? '',
+          json: JSON.stringify(part.functionCall.args ?? {})
+        })
+        turn.parts.push(part)
+      }
+      const text = parts
+        .filter((p) => !p.thought && typeof p.text === 'string')
+        .map((p) => p.text)
         .join('')
       const reason: string | undefined = candidate?.finishReason
       let finish: string | undefined
@@ -375,7 +539,7 @@ function connectError(name: string, config: ChatConfig, err: unknown): Error {
 export async function verifyChatConfig(config: ChatConfig): Promise<void> {
   const name = backendName(config)
   const preset = getChatPreset(config.preset)
-  const protocol = protocols[preset.protocol]
+  const protocol = protocols[config.protocol]
   const check = protocol.verify(config)
   // The preset's own check URL is only used with its own base URL, so a key is never sent
   // to a host other than the one configured.
@@ -397,7 +561,7 @@ const NOT_CHAT = /embed|whisper|tts|dall-e|moderation|transcri|realtime|audio|im
 // The backend's chat models, sorted by id.
 export async function listChatModels(config: ChatConfig): Promise<string[]> {
   const name = backendName(config)
-  const list = protocols[getChatPreset(config.preset).protocol].models(config)
+  const list = protocols[config.protocol].models(config)
   let res: Response
   try {
     res = await fetch(list.url, { headers: { ...list.headers, 'User-Agent': userAgent }, signal: AbortSignal.timeout(10_000) })
@@ -453,19 +617,44 @@ async function readSse(body: ReadableStream<Uint8Array>, onData: (data: string) 
   }
 }
 
-// Streams one reply, calling onDelta for each piece of text. Resolves with the finish reason.
-export async function streamChat(
+// A backend that turned down the tools themselves, as some local and compatible servers do.
+export class ToolsUnsupportedError extends Error {}
+
+type Turn = { text: string; finish: string; calls: ToolCall[]; reasoning: string; parts: unknown[] }
+
+function toolCalls(turn: TurnState): ToolCall[] {
+  return [...turn.calls.values()]
+    .filter((c) => c.name)
+    .map((c, i) => {
+      let args: unknown
+      try {
+        args = c.json.trim() ? JSON.parse(c.json) : {}
+      } catch {
+        args = {}
+      }
+      return {
+        // Gemini and some compatible servers leave ids out; ours are never sent back as theirs.
+        id: c.id || `zook_${i}`,
+        name: c.name,
+        args: args && typeof args === 'object' && !Array.isArray(args) ? (args as Record<string, unknown>) : {}
+      }
+    })
+}
+
+// Streams one model turn, calling onDelta for each piece of visible text.
+async function streamTurn(
   config: ChatConfig,
-  messages: ChatMessage[],
+  items: AgentItem[],
+  tools: ChatTool[],
+  final: boolean,
   signal: AbortSignal,
   onDelta: (text: string) => void,
-  // Stable for one conversation; sent only to presets that ask for it.
   sessionId?: string
-): Promise<string> {
+): Promise<Turn> {
   const name = backendName(config)
   const preset = getChatPreset(config.preset)
-  const protocol = protocols[preset.protocol]
-  const { url, headers, body } = protocol.request(config, messages)
+  const protocol = protocols[config.protocol]
+  const { url, headers, body } = protocol.request(config, items, tools, final)
   if (preset.sessionHeader && sessionId) headers[preset.sessionHeader] = sessionId
   let res: Response
   try {
@@ -478,19 +667,35 @@ export async function streamChat(
   } catch (err) {
     throw connectError(name, config, err)
   }
-  if (!res.ok) throw statusError(name, res.status, await errorDetail(res))
+  if (!res.ok) {
+    const detail = await errorDetail(res)
+    if (tools.length && (res.status === 400 || res.status === 422) && /tool|function/i.test(detail)) {
+      throw new ToolsUnsupportedError(detail)
+    }
+    throw statusError(name, res.status, detail)
+  }
   if (!res.body) throw new Error(`${name} sent an empty response.`)
+
+  const state: TurnState = { calls: new Map(), reasoning: '', parts: [] }
 
   // An OpenAI-compatible server that ignores `stream: true` answers with one JSON body.
   if (!res.headers.get('content-type')?.includes('text/event-stream')) {
     const data = await res.json()
     if (data.error) throw new Error(errorText(data.error))
     const choice = data.choices?.[0]
-    onDelta(choice?.message?.content ?? '')
-    return choice?.finish_reason ?? 'stop'
+    const message = choice?.message ?? {}
+    protocol.parse({ choices: [{ delta: { ...message, content: '' } }] }, state)
+    const text = message.content ?? ''
+    if (text) onDelta(text)
+    return { text, finish: choice?.finish_reason ?? 'stop', calls: toolCalls(state), reasoning: state.reasoning, parts: [] }
   }
 
-  let finishReason = 'stop'
+  let finish = 'stop'
+  let text = ''
+  // Some OpenAI-compatible servers (seen on NVIDIA's API) start every piece with the previous
+  // piece again. That's decided from the first two pieces, then the repeat is cut from each one.
+  let echoes: boolean | undefined
+  let last = ''
   await readSse(res.body, (payload) => {
     if (payload === '[DONE]') return true
     let event: unknown
@@ -499,10 +704,70 @@ export async function streamChat(
     } catch {
       return false
     }
-    const { text, finish } = protocol.parse(event)
-    if (text) onDelta(text)
-    if (finish) finishReason = finish
+    const parsed = protocol.parse(event, state)
+    let piece = parsed.text
+    if (piece && config.protocol === 'openai') {
+      if (echoes === undefined && last) echoes = piece.length > last.length && piece.startsWith(last)
+      if (echoes && piece.startsWith(last)) piece = piece.slice(last.length)
+      last = piece
+    }
+    if (piece) {
+      text += piece
+      onDelta(piece)
+    }
+    if (parsed.finish) finish = parsed.finish
     return false
   })
-  return finishReason
+  return { text, finish, calls: toolCalls(state), reasoning: state.reasoning, parts: state.parts }
+}
+
+// Enough rounds to search, read a page or two and search again, without running away.
+const MAX_TOOL_ROUNDS = 6
+
+export type ChatHandlers = {
+  onDelta(text: string): void
+  // Runs the calls the model made in one round. Results come back in the same order.
+  runTools(calls: ToolCall[]): Promise<ToolResult[]>
+}
+
+// Streams a reply, letting the model call tools between rounds of text. Resolves with the
+// finish reason of the last round. With no tools this is a single streamed reply.
+export async function runChat(
+  config: ChatConfig,
+  messages: ChatMessage[],
+  tools: ChatTool[],
+  signal: AbortSignal,
+  handlers: ChatHandlers,
+  // Stable for one conversation; sent only to presets that ask for it.
+  sessionId?: string
+): Promise<string> {
+  const items: AgentItem[] = [...messages]
+  let wrote = false
+  for (let round = 0; ; round++) {
+    const final = round >= MAX_TOOL_ROUNDS
+    // Text from a later round starts its own paragraph.
+    let gap = wrote
+    const turn = await streamTurn(
+      config,
+      items,
+      tools,
+      final,
+      signal,
+      (text) => {
+        if (gap) {
+          gap = false
+          if (!/^\s/.test(text)) text = `\n\n${text}`
+        }
+        wrote = true
+        handlers.onDelta(text)
+      },
+      sessionId
+    )
+    // Some servers ignore a request for no more tool calls; whatever text there is stands.
+    if (turn.calls.length === 0 || final) return turn.calls.length ? 'stop' : turn.finish
+    items.push({ role: 'assistant', content: turn.text, calls: turn.calls, reasoning: turn.reasoning, parts: turn.parts })
+    const results = await handlers.runTools(turn.calls)
+    if (signal.aborted) throw new DOMException('Aborted', 'AbortError')
+    items.push({ role: 'tool', results })
+  }
 }

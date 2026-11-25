@@ -1,6 +1,6 @@
 import { app } from 'electron'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
+import { readStore, writeStore, type Migration } from './store'
 
 export type SearchEntry = { query: string; at: number }
 export type VisitEntry = { url: string; title: string; at: number }
@@ -11,18 +11,33 @@ const MAX_VISITS = 2000
 
 const historyPath = () => join(app.getPath('userData'), 'history.json')
 
+const migrations: Migration[] = [
+  // v1: drop malformed entries, which unversioned files weren't checked for.
+  (data) => ({
+    searches: Array.isArray(data.searches)
+      ? data.searches.filter((s: any) => typeof s?.query === 'string' && typeof s.at === 'number')
+      : [],
+    visits: Array.isArray(data.visits)
+      ? data.visits
+          .filter((v: any) => typeof v?.url === 'string' && typeof v.at === 'number')
+          .map((v: any) => ({ url: v.url, title: typeof v.title === 'string' ? v.title : '', at: v.at }))
+      : []
+  })
+]
+
 let history: History | null = null
 let saveTimer: NodeJS.Timeout | null = null
 
 function load(): History {
   if (!history) {
-    try {
-      history = JSON.parse(readFileSync(historyPath(), 'utf8'))
-    } catch {
-      history = { searches: [], visits: [] }
+    const stored = readStore<Partial<History>>({ path: historyPath(), migrations })
+    // A file from a newer version may be shaped differently.
+    history = {
+      searches: Array.isArray(stored?.searches) ? stored.searches : [],
+      visits: Array.isArray(stored?.visits) ? stored.visits : []
     }
   }
-  return history!
+  return history
 }
 
 // Writes are batched so page loads don't hit the disk on every navigation.
@@ -35,9 +50,7 @@ export function flushHistory() {
   if (saveTimer) clearTimeout(saveTimer)
   saveTimer = null
   if (!history) return
-  const path = historyPath()
-  mkdirSync(dirname(path), { recursive: true })
-  writeFileSync(path, JSON.stringify(history), { mode: 0o600 })
+  writeStore(historyPath(), migrations.length, history)
 }
 
 export function addSearch(query: string) {

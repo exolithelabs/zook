@@ -1,0 +1,165 @@
+name: Release
+
+# Tag v<package.json version>. Builds each installer on its own OS, then signs one
+# release.json for all of them and publishes it to exolithelabs/zook.
+#
+# Secret ZOOK_RELEASE_KEY is the PKCS#8 PEM from `npm run release:keygen`. The matching
+# public key must already be committed in src/main/update-key.ts.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+            artifacts: dist/*.AppImage
+          - os: macos-latest
+            name: mac
+            artifacts: |
+              dist/*.dmg
+              dist/*.zip
+          - os: windows-latest
+            name: win
+            artifacts: dist/*.exe
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Check tag matches package.json
+        shell: bash
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $version."
+            exit 1
+          fi
+
+      - run: npm ci
+
+      # --publish never: on a tag, electron-builder would otherwise upload by itself,
+      # before release.json exists and before the other platforms have finished.
+      - name: Package
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npm run dist -- --publish never
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: zook-${{ matrix.name }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Sign and publish
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-tags: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: zook-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check tag matches package.json
+        shell: bash
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $version."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_ENV"
+
+      - name: Require every platform
+        shell: bash
+        run: |
+          missing=0
+          for spec in '*.AppImage' '*.dmg' '*.zip' '*.exe'; do
+            if ! compgen -G "dist/$spec" > /dev/null; then
+              echo "No $spec in dist/."
+              missing=1
+            fi
+          done
+          ls -la dist
+          exit "$missing"
+
+      - name: Release notes
+        shell: bash
+        run: |
+          notes=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
+          if [ -z "${notes//[[:space:]]/}" ]; then
+            notes=$(git log -1 --pretty=%B)
+          fi
+          printf '%s\n' "$notes" > notes.txt
+
+      - name: Install release signing key
+        env:
+          ZOOK_RELEASE_KEY_PEM: ${{ secrets.ZOOK_RELEASE_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$ZOOK_RELEASE_KEY_PEM" ]; then
+            echo "Set the ZOOK_RELEASE_KEY secret to the PEM from npm run release:keygen."
+            exit 1
+          fi
+          umask 077
+          dir="$RUNNER_TEMP/zook-release"
+          mkdir -p "$dir"
+          printf '%s\n' "$ZOOK_RELEASE_KEY_PEM" > "$dir/ed25519.pem"
+          echo "ZOOK_RELEASE_KEY=$dir/ed25519.pem" >> "$GITHUB_ENV"
+
+      - name: Sign release.json
+        run: node scripts/release.mjs sign --notes-file notes.txt
+
+      - name: Publish to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          args=(
+            release create "v$version"
+            --repo exolithelabs/zook
+            --title "Zook $version"
+            --notes-file notes.txt
+          )
+          if [[ "$version" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          shopt -s nullglob
+          files=(dist/*.AppImage dist/*.dmg dist/*.zip dist/*.exe dist/release.json dist/release.json.sig)
+          gh "${args[@]}" "${files[@]}"

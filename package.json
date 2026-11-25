@@ -2,13 +2,16 @@
   "name": "zook",
   "version": "0.1.0",
   "description": "A search app with an in-app browser",
+  "license": "Apache-2.0",
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "electron-vite build",
+    "build": "electron-vite build && node scripts/licenses.mjs",
     "start": "electron-vite preview",
-    "dist": "electron-vite build && electron-builder",
-    "typecheck": "svelte-check --tsconfig ./tsconfig.json"
+    "dist": "npm run build && electron-builder",
+    "typecheck": "svelte-check --tsconfig ./tsconfig.json",
+    "release:keygen": "node scripts/release.mjs keygen",
+    "release:sign": "node scripts/release.mjs sign"
   },
   "build": {
     "appId": "app.zook",
@@ -19,8 +22,46 @@
     "linux": {
       "target": [
         "AppImage"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
       ]
-    }
+    },
+    "nsis": {
+      "artifactName": "${productName}-Setup-${version}-${arch}.${ext}"
+    },
+    "asarUnpack": [
+      "out/licenses/LICENSES.chromium.html"
+    ]
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.3.1",

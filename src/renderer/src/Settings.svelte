@@ -1,13 +1,14 @@
 <script lang="ts" module>
-  export type SettingsSection = 'search' | 'chat' | 'general'
+  export type SettingsSection = 'search' | 'chat' | 'general' | 'updates' | 'licenses'
 </script>
 
 <script lang="ts">
-  import type { ChatPresetId } from '../../main/chat'
   import type { ProviderId } from '../../main/providers'
-  import type { ProviderStatus, SettingsStatus } from '../../main/settings'
+  import type { ChatBackendStatus, ProviderStatus, SettingsStatus } from '../../main/settings'
   import Icon, { type IconName } from './Icon.svelte'
+  import Licenses from './Licenses.svelte'
   import { errorMessage } from './errors'
+  import { formatSize, installLabel, updates } from './updates.svelte'
 
   let {
     status,
@@ -23,7 +24,9 @@
   } = $props()
 
   // The credential form that's open. There is only ever one, across every section.
-  type Target = `provider:${ProviderId}` | 'chat' | 'suggest'
+  // `chat:new` is a custom backend being added.
+  type Target = `provider:${ProviderId}` | `chat:${string}` | 'suggest'
+  const NEW_CHAT = 'chat:new'
 
   let current = $state<SettingsSection>('search')
   let editing = $state<Target | null>(null)
@@ -34,12 +37,14 @@
   let confirmRemove = $state(false)
 
   const activeProvider = $derived(status?.providers.find((p) => p.id === status.active && p.source !== 'none'))
-  const chatReady = $derived(Boolean(status && status.chat.source !== 'none'))
+  const chatReady = $derived(Boolean(status?.chat.active))
 
   const sections = $derived<{ id: SettingsSection; label: string; icon: IconName; needsSetup: boolean }[]>([
     { id: 'search', label: 'Search', icon: 'search', needsSetup: Boolean(status) && !activeProvider },
     { id: 'chat', label: 'AI chat', icon: 'chat', needsSetup: Boolean(status) && !chatReady },
-    { id: 'general', label: 'General', icon: 'settings', needsSetup: false }
+    { id: 'general', label: 'General', icon: 'settings', needsSetup: false },
+    { id: 'updates', label: 'Updates', icon: 'download', needsSetup: false },
+    { id: 'licenses', label: 'Licenses', icon: 'license', needsSetup: false }
   ])
   // Opens on the requested section once settings have loaded, with its form ready if it isn't set up.
   let opened = false
@@ -55,8 +60,6 @@
     if (!status) return
     if (to === 'search' && !status.providers.some((p) => p.source !== 'none')) {
       editProvider(status.providers.find((p) => p.id === status.active) ?? status.providers[0])
-    } else if (to === 'chat' && status.chat.source === 'none') {
-      editChat()
     }
   }
 
@@ -119,39 +122,66 @@
 
   // AI chat
 
-  let chatPreset = $state<ChatPresetId>('openai')
-  // Presets fill in their own endpoint; it's only shown as a field for Custom, or when asked for.
+  // The backend whose form is open, or null for a new custom one.
+  let chatId = $state<string | null>(null)
+  // Built-in backends fill in their own endpoint; it's only shown as a field for custom ones, or when asked for.
   let customUrl = $state(false)
-  const preset = $derived(status?.chat.presets.find((p) => p.id === chatPreset))
+  const chatBackend = $derived(chatId === null ? undefined : status?.chat.backends.find((b) => b.id === chatId))
+  const chatCustom = $derived(chatId === null || Boolean(chatBackend?.custom))
+  const chatNeedsKey = $derived(Boolean(chatBackend?.needsKey))
 
-  function editChat() {
-    if (!status) return
-    const c = status.chat
-    const saved = c.presets.find((p) => p.id === c.preset)
-    chatPreset = c.preset
-    startEdit('chat', { baseUrl: c.baseUrl || saved?.baseUrl || '', model: c.model || saved?.model || '', apiKey: '' })
-    customUrl = c.preset === 'custom' || Boolean(c.baseUrl && c.baseUrl !== saved?.baseUrl)
+  function editChat(b: ChatBackendStatus) {
+    chatId = b.id
+    startEdit(`chat:${b.id}`, {
+      name: b.custom ? b.name : '',
+      protocol: b.protocol,
+      baseUrl: b.baseUrl,
+      model: b.model,
+      apiKey: ''
+    })
+    customUrl = b.custom || b.baseUrl !== b.defaultBaseUrl
     typeModel = false
   }
 
-  function pickPreset(id: ChatPresetId) {
-    chatPreset = id
-    const p = status?.chat.presets.find((p) => p.id === id)
-    // Custom keeps whatever was typed, as a starting point.
-    if (p && id !== 'custom') {
-      values.baseUrl = p.baseUrl
-      values.model = p.model
-    }
-    customUrl = id === 'custom'
+  function addCustomChat() {
+    chatId = null
+    startEdit(NEW_CHAT, { name: '', protocol: 'openai', baseUrl: '', model: '', apiKey: '' })
+    customUrl = true
     typeModel = false
+  }
+
+  async function activateChat(b: ChatBackendStatus) {
+    if (b.source === 'none' || status?.chat.active === b.id) return
+    onchange(await window.zook.settings.setActiveChat(b.id))
+  }
+
+  function normalizeUrl(url: string | undefined): string {
+    return (url ?? '').trim().replace(/\/+$/, '')
+  }
+
+  function hostOf(url: string | undefined): string {
+    try {
+      return new URL(normalizeUrl(url)).host
+    } catch {
+      return ''
+    }
   }
 
   // A saved key is kept when the field is left blank, but only for the same endpoint.
   const chatKeyKept = $derived(
-    status?.chat.source === 'settings' &&
-      Boolean(status.chat.hint) &&
-      status.chat.baseUrl === (values.baseUrl ?? '').trim().replace(/\/+$/, '')
+    Boolean(chatBackend && chatBackend.source !== 'none' && chatBackend.hint) &&
+      chatBackend?.baseUrl === normalizeUrl(values.baseUrl)
   )
+
+  function chatForm() {
+    return {
+      name: values.name ?? '',
+      protocol: values.protocol ?? '',
+      baseUrl: values.baseUrl ?? '',
+      model: values.model ?? '',
+      apiKey: values.apiKey ?? ''
+    }
+  }
 
   // The backend's models, fetched once the endpoint (and key, where needed) are filled in.
   let models = $state<string[]>([])
@@ -162,11 +192,12 @@
   let modelsRequest = 0
 
   $effect(() => {
-    if (editing !== 'chat') return
-    const baseUrl = (values.baseUrl ?? '').trim()
-    const apiKey = values.apiKey ?? ''
-    const id = chatPreset
-    const ready = /^https?:\/\/[^/]/i.test(baseUrl) && (!preset?.needsKey || apiKey.trim() !== '' || chatKeyKept)
+    if (!editing?.startsWith('chat:')) return
+    // Only what the list depends on, so picking a model or naming the backend doesn't refetch it.
+    const form = { protocol: values.protocol ?? '', baseUrl: values.baseUrl ?? '', apiKey: values.apiKey ?? '' }
+    const id = chatId
+    const ready =
+      /^https?:\/\/[^/]/i.test(form.baseUrl.trim()) && (!chatNeedsKey || form.apiKey.trim() !== '' || chatKeyKept)
     const request = ++modelsRequest
     models = []
     modelsError = ''
@@ -175,7 +206,7 @@
     // Waits for typing to pause, so a half-typed key or URL isn't sent.
     const timer = setTimeout(async () => {
       try {
-        const list = await window.zook.settings.listChatModels(id, baseUrl, apiKey)
+        const list = await window.zook.settings.listChatModels(id, form)
         if (request === modelsRequest) models = list
       } catch (err) {
         if (request === modelsRequest) modelsError = errorMessage(err)
@@ -193,7 +224,7 @@
 
   function saveChat(e: SubmitEvent) {
     e.preventDefault()
-    apply(() => window.zook.settings.saveChat(chatPreset, values.baseUrl, values.model, values.apiKey))
+    apply(() => window.zook.settings.saveChat(chatId, chatForm()))
   }
 
   let groundedError = $state('')
@@ -222,6 +253,28 @@
       adblockError = errorMessage(err)
     } finally {
       adblockBusy = false
+    }
+  }
+
+  // Updates
+
+  const update = $derived(updates.status)
+  const updateState = $derived(update?.state)
+  const updateRelease = $derived(updateState && 'release' in updateState ? updateState.release : undefined)
+
+  function formatDate(iso: string): string {
+    const date = new Date(iso)
+    return isNaN(date.getTime()) ? '' : date.toLocaleDateString(undefined, { dateStyle: 'medium' })
+  }
+
+  let logsError = $state('')
+
+  async function openLogs() {
+    logsError = ''
+    try {
+      await window.zook.logs.open()
+    } catch (err) {
+      logsError = errorMessage(err)
     }
   }
 
@@ -293,6 +346,75 @@
   <a href={url} target="_blank" rel="noreferrer">Get a key <Icon name="external" /></a>
 {/snippet}
 
+{#snippet chatSetup(b: ChatBackendStatus | undefined)}
+  <form onsubmit={saveChat}>
+    {#if chatCustom}
+      {@render field('name', 'Name', { placeholder: hostOf(values.baseUrl) || 'My backend', focus: true })}
+      <label class="field-label">
+        <span>API format</span>
+        <span class="field">
+          <select bind:value={values.protocol}>
+            {#each status?.chat.protocols ?? [] as p (p.id)}<option value={p.id}>{p.name}</option>{/each}
+          </select>
+        </span>
+      </label>
+    {:else if b?.note || b?.signupUrl}
+      <p class="hint">
+        {b.note ?? ''}
+        {#if b.signupUrl}{@render getKey(b.signupUrl)}{/if}
+      </p>
+    {/if}
+    {#if customUrl}
+      {@render field('baseUrl', 'Endpoint', { placeholder: 'https://example.com/v1' })}
+    {:else}
+      <p class="hint">
+        <code>{values.baseUrl}</code>
+        <button type="button" class="link" onclick={() => (customUrl = true)}>Change URL</button>
+      </p>
+    {/if}
+    {@render field('apiKey', 'API key', {
+      secret: true,
+      optional: !chatNeedsKey,
+      placeholder: chatKeyKept ? `Keep ${b?.hint}` : '',
+      focus: !chatCustom
+    })}
+    {#if typeModel || (!modelsLoading && models.length === 0)}
+      {@render field('model', 'Model', { placeholder: 'model id', focus: typeModel })}
+    {:else}
+      <label class="field-label">
+        <span>Model</span>
+        <span class="field">
+          <select
+            value={values.model}
+            disabled={modelsLoading}
+            onchange={(e) => {
+              if (e.currentTarget.value === '') typeModel = true
+              else values.model = e.currentTarget.value
+            }}
+          >
+            {#if modelsLoading}
+              <option value={values.model}>Loading models…</option>
+            {:else}
+              {#each modelOptions as m (m)}<option value={m}>{m}</option>{/each}
+              <option value="">Other…</option>
+            {/if}
+          </select>
+        </span>
+      </label>
+    {/if}
+    {#if modelsError && !typeModel}
+      <p class="hint">Couldn't load models: {modelsError}</p>
+    {:else if typeModel && models.length > 0}
+      <p class="hint"><button type="button" class="link" onclick={() => (typeModel = false)}>Pick from list</button></p>
+    {/if}
+    {@render formActions(
+      b?.source === 'settings',
+      () => b && apply(() => window.zook.settings.clearChat(b.id)),
+      !values.baseUrl?.trim() || !values.model?.trim() || (chatNeedsKey && !values.apiKey?.trim() && !chatKeyKept)
+    )}
+  </form>
+{/snippet}
+
 <div class="backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && onclose()}>
   <div class="panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
     <header>
@@ -354,93 +476,49 @@
             {/each}
           </ul>
         {:else if current === 'chat'}
-          <div class="card" class:open={editing === 'chat'}>
-            <div class="card-head">
-              <span class="name">{chatReady ? status.chat.name : 'Model'}</span>
-              <span class="state">
-                {#if chatReady}
-                  <code>{status.chat.model}</code>
-                  {#if status.chat.hint}<code>{status.chat.hint}</code>{/if}
-                  {#if status.chat.source === 'env'}· .env{/if}
-                {:else}
-                  Not set up
-                {/if}
-              </span>
-              {#if editing !== 'chat'}
-                <button class="btn" class:primary={!chatReady} onclick={editChat}>{chatReady ? 'Change' : 'Set up'}</button>
-              {/if}
-            </div>
-            {#if editing === 'chat'}
-              <form onsubmit={saveChat}>
-                <label class="field-label">
-                  <span>Backend</span>
-                  <span class="field">
-                    <!-- svelte-ignore a11y_autofocus -->
-                    <select value={chatPreset} onchange={(e) => pickPreset(e.currentTarget.value as ChatPresetId)} autofocus>
-                      {#each status.chat.presets as p (p.id)}
-                        <option value={p.id}>{p.name}</option>
-                      {/each}
-                    </select>
-                  </span>
-                </label>
-                {#if preset?.note || preset?.signupUrl}
-                  <p class="hint">
-                    {preset?.note ?? ''}
-                    {#if preset?.signupUrl}{@render getKey(preset.signupUrl)}{/if}
-                  </p>
-                {/if}
-                {#if customUrl}
-                  {@render field('baseUrl', 'Endpoint', { placeholder: 'https://example.com/v1' })}
-                {:else}
-                  <p class="hint">
-                    <code>{values.baseUrl}</code>
-                    <button type="button" class="link" onclick={() => (customUrl = true)}>Change URL</button>
-                  </p>
-                {/if}
-                {@render field('apiKey', 'API key', {
-                  secret: true,
-                  optional: !preset?.needsKey,
-                  placeholder: chatKeyKept ? `Keep ${status.chat.hint}` : ''
-                })}
-                {#if typeModel || (!modelsLoading && models.length === 0)}
-                  {@render field('model', 'Model', { placeholder: 'model id', focus: typeModel })}
-                {:else}
-                  <label class="field-label">
-                    <span>Model</span>
-                    <span class="field">
-                      <select
-                        value={values.model}
-                        disabled={modelsLoading}
-                        onchange={(e) => {
-                          if (e.currentTarget.value === '') typeModel = true
-                          else values.model = e.currentTarget.value
-                        }}
-                      >
-                        {#if modelsLoading}
-                          <option value={values.model}>Loading models…</option>
-                        {:else}
-                          {#each modelOptions as m (m)}<option value={m}>{m}</option>{/each}
-                          <option value="">Other…</option>
-                        {/if}
-                      </select>
+          <ul class="cards">
+            {#each status.chat.backends as b (b.id)}
+              {@const target: Target = `chat:${b.id}`}
+              {@const configured = b.source !== 'none'}
+              {@const active = status.chat.active === b.id}
+              <li class="card" class:active class:open={editing === target}>
+                <div class="card-head">
+                  <label class="pick" class:disabled={!configured} title={configured ? `Chat with ${b.name}` : 'Set it up first'}>
+                    <input type="radio" name="chat-backend" checked={active} disabled={!configured} onchange={() => activateChat(b)} />
+                    <span class="name">
+                      {b.name}{#if b.custom}<span class="optional">
+                          · {status.chat.protocols.find((p) => p.id === b.protocol)?.name}</span
+                        >{/if}
+                    </span>
+                    <span class="state">
+                      {#if configured}
+                        <code class="model">{b.model}</code>
+                        {#if b.hint}<code>{b.hint}</code>{/if}
+                        {#if b.source === 'env'}· .env{/if}
+                      {:else}
+                        Not set up
+                      {/if}
                     </span>
                   </label>
-                {/if}
-                {#if modelsError && !typeModel}
-                  <p class="hint">Couldn't load models: {modelsError}</p>
-                {:else if typeModel && models.length > 0}
-                  <p class="hint"><button type="button" class="link" onclick={() => (typeModel = false)}>Pick from list</button></p>
-                {/if}
-                {@render formActions(
-                  status.chat.source === 'settings',
-                  () => apply(() => window.zook.settings.clearChat()),
-                  !values.baseUrl?.trim() ||
-                    !values.model?.trim() ||
-                    Boolean(preset?.needsKey && !values.apiKey?.trim() && !chatKeyKept)
-                )}
-              </form>
+                  {#if editing !== target}
+                    <button class="btn" class:primary={!configured && !chatReady} onclick={() => editChat(b)}>
+                      {configured ? 'Change' : 'Set up'}
+                    </button>
+                  {/if}
+                </div>
+                {#if editing === target}{@render chatSetup(b)}{/if}
+              </li>
+            {/each}
+            {#if editing === NEW_CHAT}
+              <li class="card open">
+                <div class="card-head"><span class="name">New custom backend</span></div>
+                {@render chatSetup(undefined)}
+              </li>
             {/if}
-          </div>
+          </ul>
+          {#if editing !== NEW_CHAT}
+            <button class="add" onclick={addCustomChat}><Icon name="plus" /> Custom backend</button>
+          {/if}
 
           <!-- Always shows and saves the preference itself. Without a search provider it can't take effect yet,
                which the row says, rather than the switch pretending to be off and refusing to change. -->
@@ -452,7 +530,7 @@
               checked={status.chat.grounded}
               onchange={(e) => setGrounded(e.currentTarget.checked)}
             />
-            <span class="name">Search the web before answering</span>
+            <span class="name">Let AI search the web</span>
             {#if !activeProvider}
               <span class="state warn">
                 No search provider
@@ -461,7 +539,7 @@
             {/if}
           </label>
           {#if groundedError}<p class="error" role="alert">{groundedError}</p>{/if}
-        {:else}
+        {:else if current === 'general'}
           <label class="switch-row card">
             <input
               type="checkbox"
@@ -498,6 +576,92 @@
               </form>
             {/if}
           </div>
+
+          <div class="card">
+            <div class="card-head">
+              <span class="name">Logs<span class="optional"> · errors and crash reports, kept on this device</span></span>
+              <button class="btn" onclick={openLogs}>Open folder</button>
+            </div>
+          </div>
+          {#if logsError}<p class="error" role="alert">{logsError}</p>{/if}
+        {:else if current === 'licenses'}
+          <Licenses />
+        {:else if update && updateState}
+          <div class="card" class:open={Boolean(updateRelease)}>
+            <div class="card-head">
+              <span class="name">Zook {update.current}</span>
+              <span class="state" class:warn={updateState.phase === 'error'}>
+                {#if updateState.phase === 'checking'}
+                  Checking…
+                {:else if updateState.phase === 'current'}
+                  Up to date
+                {:else if updateState.phase === 'available'}
+                  {updateState.release.version} available{#if updateState.release.size}<span>
+                      · {formatSize(updateState.release.size)}</span
+                    >{/if}
+                {:else if updateState.phase === 'downloading'}
+                  {formatSize(updateState.received)} of {formatSize(updateState.release.size ?? 0)}
+                {:else if updateState.phase === 'ready'}
+                  {updateState.release.version} {update.install === 'appimage' ? 'installed' : 'downloaded'}
+                {/if}
+              </span>
+              {#if updateState.phase === 'downloading'}
+                <button class="btn" onclick={updates.cancel}>Cancel</button>
+              {:else if updateState.phase === 'ready'}
+                <button class="btn primary" onclick={updates.install}>{installLabel(update)}</button>
+              {:else if updateRelease && update.install !== 'link'}
+                <button class="btn primary" onclick={updates.download}>
+                  {updateState.phase === 'error' ? 'Try again' : 'Download and install'}
+                </button>
+              {:else if updateRelease}
+                <a class="btn primary" href={updateRelease.url} target="_blank" rel="noreferrer">Download <Icon name="external" /></a>
+              {:else}
+                <button class="btn" disabled={!update.canCheck || updateState.phase === 'checking'} onclick={updates.check}>
+                  Check now
+                </button>
+              {/if}
+            </div>
+            {#if updateState.phase === 'downloading'}
+              <progress class="progress" max={updateState.release.size ?? 0} value={updateState.received}></progress>
+            {/if}
+            {#if updateRelease}
+              <div class="release">
+                <p class="hint">
+                  What's new in {updateRelease.version}{#if formatDate(updateRelease.date)}<span> · {formatDate(updateRelease.date)}</span>{/if}
+                  · <a href={updateRelease.url} target="_blank" rel="noreferrer">Release page <Icon name="external" /></a>
+                </p>
+                {#if updateRelease.notes}<p class="notes">{updateRelease.notes}</p>{/if}
+              </div>
+            {/if}
+          </div>
+          {#if updateState.phase === 'error'}<p class="error" role="alert">{updateState.message}</p>{/if}
+          {#if updates.error}<p class="error" role="alert">{updates.error}</p>{/if}
+          {#if update.reason}
+            <p class="hint">
+              {update.reason}
+              <a href={update.releasesUrl} target="_blank" rel="noreferrer">Releases <Icon name="external" /></a>
+            </p>
+          {/if}
+
+          <label class="switch-row card">
+            <input
+              type="checkbox"
+              role="switch"
+              class="switch"
+              checked={update.auto}
+              disabled={!update.canCheck}
+              onchange={(e) => updates.setAuto(e.currentTarget.checked)}
+            />
+            <span class="name">Check for updates automatically</span>
+            {#if update.checkedAt}
+              <span class="state">Last checked {new Date(update.checkedAt).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' })}</span>
+            {/if}
+          </label>
+          <p class="hint">
+            Updates come from GitHub releases and are only installed once their signature and checksum check out.
+          </p>
+        {:else}
+          <p class="muted">Loading…</p>
         {/if}
       </div>
     </div>
@@ -613,6 +777,24 @@
   .name { font-size: 14px; font-weight: 500; }
   .state { flex-shrink: 0; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
   .state.warn { color: var(--error); }
+  .state .model { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Quieter than a card, so it reads as an option rather than another backend. */
+  .add {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-height: 36px;
+    border: 1px dashed var(--box-border);
+    border-radius: 8px;
+    background: none;
+    color: var(--muted);
+    font-size: 13px;
+    cursor: pointer;
+    transition: background-color 0.12s, color 0.12s, border-color 0.12s;
+  }
+  .add:hover { border-color: var(--focus-border); background: color-mix(in srgb, var(--surface) 60%, var(--bg)); color: var(--fg); }
 
   form { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--box-border); }
   .field-label { display: block; margin-top: 8px; font-size: 13px; }
@@ -712,6 +894,11 @@
   .switch:checked { background: var(--accent); }
   .switch:checked::before { transform: translateX(14px); }
   .switch:disabled { opacity: 0.5; }
+  .progress { display: block; width: 100%; height: 6px; margin: 8px 0 2px; accent-color: var(--accent); }
+  .release { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--box-border); }
+  .notes { max-height: 220px; overflow-y: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+  a.btn { display: inline-flex; align-items: center; gap: 6px; color: inherit; text-decoration: none; }
+  a.btn.primary { color: var(--bg); }
   .switch:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent); outline-offset: 2px; }
 
   /* Narrow windows: the section list becomes a row of tabs above the content. */

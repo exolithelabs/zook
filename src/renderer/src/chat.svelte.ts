@@ -1,3 +1,4 @@
+import type { Activity } from '../../main/research'
 import type { SettingsStatus } from '../../main/settings'
 import type { Thread, ThreadSummary, ThreadTurn } from '../../main/threads'
 import { errorMessage } from './errors'
@@ -8,7 +9,8 @@ export function groundedFor(settings: SettingsStatus | null): boolean {
   return Boolean(settings?.chat.grounded && settings.providers.some((p) => p.id === settings.active && p.source !== 'none'))
 }
 
-export type ChatTurn = ThreadTurn & { status?: 'searching' | 'streaming' }
+// While a reply is on its way: what the model is doing right now, if it's using a tool.
+export type ChatTurn = ThreadTurn & { status?: 'streaming'; activity?: Activity }
 
 export type ChatThread = Omit<Thread, 'turns'> & {
   turns: ChatTurn[]
@@ -89,7 +91,7 @@ class Chats {
   async remove(id: string) {
     const thread = this.loaded[id]
     if (thread?.requestId) {
-      if (thread.requestId !== 'starting') {
+      if (!thread.requestId.startsWith('starting-')) {
         window.zook.chat.abort(thread.requestId)
         pending.delete(thread.requestId)
       }
@@ -114,19 +116,22 @@ class Chats {
     thread.title ||= titleFrom(text)
     thread.updatedAt = now
     thread.turns.push({ role: 'user', content: text, at: now })
-    thread.turns.push({ role: 'assistant', content: '', at: now, status: thread.grounded ? 'searching' : 'streaming' })
+    thread.turns.push({ role: 'assistant', content: '', at: now, status: 'streaming' })
     const reply = thread.turns.at(-1)!
-    // Marks the thread busy until main hands back the real id.
-    thread.requestId = 'starting'
+    // Marks the thread busy until main hands back the real id. Each send has its own marker, so a
+    // send stopped while starting can't mistake a newer send's marker for its own.
+    const starting = `starting-${crypto.randomUUID()}`
+    thread.requestId = starting
     // The question is saved straight away, so it survives even if the reply never arrives.
     this.persist(thread)
     try {
       const { requestId, backend } = await window.zook.chat.start(
         [...history, { role: 'user', content: text }],
         thread.grounded,
-        thread.sessionId
+        thread.sessionId,
+        { sources: $state.snapshot(thread.sources) ?? [], pages: $state.snapshot(thread.pages) ?? [] }
       )
-      if (thread.requestId !== 'starting') {
+      if (thread.requestId !== starting) {
         // Stopped before the request id arrived.
         window.zook.chat.abort(requestId)
         return
@@ -135,6 +140,8 @@ class Chats {
       reply.backend = backend
       pending.set(requestId, thread.id)
     } catch (e) {
+      // Stopped meanwhile; a newer send may own the thread by now.
+      if (thread.requestId !== starting) return
       thread.requestId = null
       reply.status = undefined
       reply.error = errorMessage(e)
@@ -150,9 +157,18 @@ class Chats {
     this.send(thread, question.content, grounded)
   }
 
+  // Asks an earlier question again with new text, dropping it and everything after it.
+  // A reply still on its way is stopped first.
+  edit(thread: ChatThread, index: number, text: string, grounded: boolean) {
+    if (thread.turns[index]?.role !== 'user' || !text.trim()) return
+    if (thread.requestId) this.stop(thread)
+    thread.turns.splice(index)
+    this.send(thread, text, grounded)
+  }
+
   stop(thread: ChatThread) {
     if (!thread.requestId) return
-    if (thread.requestId !== 'starting') {
+    if (!thread.requestId.startsWith('starting-')) {
       window.zook.chat.abort(thread.requestId)
       pending.delete(thread.requestId)
     }
@@ -160,6 +176,7 @@ class Chats {
     const turn = thread.turns.at(-1)
     if (turn?.role === 'assistant') {
       turn.status = undefined
+      turn.activity = undefined
       if (!turn.content) turn.error = 'Stopped.'
     }
     this.persist(thread)
@@ -167,16 +184,28 @@ class Chats {
 
   listen(): () => void {
     const offs = [
-      window.zook.chat.onSources(({ requestId, sources }) => {
+      window.zook.chat.onActivity(({ requestId, activity }) => {
         const reply = this.replyFor(requestId)
         if (!reply) return
-        reply.turn.sources = sources
-        reply.turn.status = 'streaming'
+        reply.turn.activity = activity
+        if (activity.kind === 'search' && !reply.turn.queries?.includes(activity.text)) {
+          reply.turn.queries = [...(reply.turn.queries ?? []), activity.text]
+        }
+      }),
+      window.zook.chat.onContext(({ requestId, context }) => {
+        const reply = this.replyFor(requestId)
+        if (!reply) return
+        reply.thread.sources = context.sources
+        reply.thread.pages = context.pages
+      }),
+      window.zook.chat.onSources(({ requestId, sources }) => {
+        const reply = this.replyFor(requestId)
+        if (reply && sources.length) reply.turn.sources = sources
       }),
       window.zook.chat.onDelta(({ requestId, text }) => {
         const reply = this.replyFor(requestId)
         if (!reply) return
-        reply.turn.status = 'streaming'
+        reply.turn.activity = undefined
         reply.turn.content += text
       }),
       window.zook.chat.onDone(({ requestId, finishReason }) => this.finish(requestId, finishNotes[finishReason])),
@@ -207,6 +236,7 @@ class Chats {
     if (!reply) return
     reply.thread.requestId = null
     reply.turn.status = undefined
+    reply.turn.activity = undefined
     if (error) reply.turn.error = error
     this.persist(reply.thread)
     // A reply that finished after its thread was left no longer needs to stay in memory.
@@ -218,7 +248,7 @@ class Chats {
     // A deleted thread isn't saved back, even if a reply for it was still on its way.
     if (thread.turns.length === 0 || this.loaded[thread.id] !== thread) return
     const { requestId: _, turns, ...rest } = $state.snapshot(thread)
-    const saved: Thread = { ...rest, turns: turns.map(({ status: _, ...turn }) => turn) }
+    const saved: Thread = { ...rest, turns: turns.map(({ status: _, activity: __, ...turn }) => turn) }
     window.zook.threads
       .save(saved)
       .then((list) => (this.list = list))

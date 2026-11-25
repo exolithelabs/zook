@@ -43,6 +43,10 @@
     onopenchange?.(open)
   })
 
+  // Searching from the home box removes it in the same update that closes its dropdown, before the
+  // effect above can report that, so the parent would think it is still open (and keep pages hidden).
+  $effect(() => () => onopenchange?.(false))
+
   $effect(() => {
     if (autofocus) input?.focus()
   })

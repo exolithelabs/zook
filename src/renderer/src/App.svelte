@@ -9,8 +9,10 @@
   import Settings, { type SettingsSection } from './Settings.svelte'
   import Sidebar from './Sidebar.svelte'
   import SuggestInput, { type Suggestion } from './SuggestInput.svelte'
+  import UpdateBanner from './UpdateBanner.svelte'
   import { chats, groundedFor } from './chat.svelte'
   import { errorMessage } from './errors'
+  import { updates } from './updates.svelte'
   import { view } from './view.svelte'
 
   let settingsStatus = $state<SettingsStatus | null>(null)
@@ -64,7 +66,8 @@
       // Only links followed in the top popup stack; anything from a page beneath is stale.
       window.zook.page.onLink(({ from, url }) => view.page?.id === from && view.push(url)),
       window.zook.onShortcut(onShortcut),
-      chats.listen()
+      chats.listen(),
+      updates.listen()
     ]
     return () => offs.forEach((off) => off())
   })
@@ -132,7 +135,8 @@
       return
     }
     let cancelled = false
-    window.zook.page.capture(id).then((img) => {
+    // A failed capture just leaves no picture; the page is still hidden for the overlay.
+    window.zook.page.capture(id).catch(() => null).then((img) => {
       if (cancelled) return
       snapshot = img
       if (img) lastSnapshot = { pageId: id, img }
@@ -322,6 +326,8 @@
       <button onclick={() => (historyOpen = true)} title="History (Ctrl+H)" aria-label="History"><Icon name="history" /></button>
       <button onclick={() => openSettings()} title="Settings" aria-label="Settings"><Icon name="settings" /></button>
     </nav>
+
+    <UpdateBanner ondetails={() => openSettings('updates')} />
 
     <div class="content">
       {#if view.showing === 'chat'}

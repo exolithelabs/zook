@@ -2,6 +2,7 @@ import {
   app,
   BrowserWindow,
   clipboard,
+  dialog,
   ipcMain,
   Menu,
   session,
@@ -17,11 +18,11 @@ import { setAdblock } from './adblock'
 import {
   backendName,
   listChatModels,
+  runChat,
   setChatUserAgent,
-  streamChat,
+  ToolsUnsupportedError,
   verifyChatConfig,
-  type ChatMessage,
-  type ChatPresetId
+  type ChatMessage
 } from './chat'
 import {
   addSearch,
@@ -34,13 +35,26 @@ import {
   suggestFromHistory,
   updateVisitTitle
 } from './history'
-import { getProvider, verticalSearch, type ProviderId, type SearchResult, type Vertical } from './providers'
+import { getNotices, openChromiumNotices } from './licenses'
+import { initLogging, logRendererError, logsDir } from './log'
+import { getProvider, verticalSearch, type ProviderId, type Vertical } from './providers'
+import { buildMessages, sourcesFor, startResearch, type ChatSource } from './research'
+import {
+  checkRendererCsp,
+  hardenApp,
+  hardenSessions,
+  isWebUrl,
+  openExternal,
+  secureWebPreferences,
+  setAppMenu
+} from './security'
 import {
   clearChatConfig,
   clearCredentials,
   clearSuggestKey,
   getActiveProvider,
   getAdblock,
+  getAutoUpdate,
   getChatConfig,
   getCredentials,
   getStatus,
@@ -50,13 +64,42 @@ import {
   saveChatConfig,
   saveCredentials,
   saveSuggestKey,
+  setActiveChat,
   setActiveProvider,
   setAdblock as saveAdblockSetting,
+  setAutoUpdate,
   setChatGrounded,
-  setSidebarOpen
+  setSidebarOpen,
+  type ChatForm
 } from './settings'
 import { braveSuggest } from './suggest'
-import { deleteThread, flushThreads, getThread, listThreads, renameThread, saveThread, type ChatBackend } from './threads'
+import {
+  cleanContext,
+  deleteThread,
+  flushThreads,
+  getThread,
+  listThreads,
+  renameThread,
+  saveThread,
+  type ChatBackend
+} from './threads'
+import {
+  cancelDownload,
+  checkForUpdates,
+  downloadUpdate,
+  getUpdateStatus,
+  installUpdate,
+  rescheduleUpdates,
+  startUpdater
+} from './updater'
+
+initLogging()
+hardenApp()
+
+// One Zook at a time: a second launch focuses the running window instead, and the stores
+// (which assume a single writer) are never written by two processes at once.
+const isPrimaryInstance = app.requestSingleInstanceLock()
+if (!isPrimaryInstance) app.quit()
 
 // Chromium only picks a keyring on desktops it recognizes (GNOME, KDE, ...). On others,
 // such as Hyprland, it falls back to plain text even when a Secret Service like
@@ -118,41 +161,7 @@ async function search(vertical: Vertical, query: string, page: number) {
 
 const chats = new Map<string, AbortController>()
 
-const GROUNDING_RESULTS = 6
-// Keeps requests to a sensible size; older turns matter least.
-const MAX_HISTORY = 20
-
-const SYSTEM_PROMPT =
-  'You are Zook, a helpful assistant inside a web search app. Answer clearly and concisely. Use Markdown for lists, bold text and code blocks.'
-
-export type ChatSource = { n: number; title: string; url: string; displayUrl: string; favicon?: string }
-
-function toSource(r: SearchResult, i: number): ChatSource {
-  return { n: i + 1, title: r.title, url: r.url, displayUrl: r.displayUrl, favicon: r.favicon }
-}
-
-// Snippets are display HTML; the model gets plain text.
-function plainText(html: string): string {
-  return html
-    .replace(/<[^>]*>/g, '')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-}
-
-function groundingPrompt(sources: ChatSource[], results: SearchResult[]): string {
-  if (sources.length === 0) {
-    return 'A web search for this question returned no results. Say so, then answer from your own knowledge if you can.'
-  }
-  const list = sources
-    .map((s, i) => `[${s.n}] ${s.title}\nURL: ${s.url}\n${plainText(results[i].snippet)}`)
-    .join('\n\n')
-  return (
-    'Answer the latest question using these web search results. Cite them inline by number, like [1] or [2][3], ' +
-    'right after the statement they support. Only cite numbers from this list. If the results do not answer the ' +
-    `question, say so.\n\n${list}`
-  )
-}
+export type { ChatSource }
 
 function sanitizeMessages(messages: unknown): ChatMessage[] {
   if (!Array.isArray(messages)) return []
@@ -162,7 +171,6 @@ function sanitizeMessages(messages: unknown): ChatMessage[] {
         (m?.role === 'user' || m?.role === 'assistant') && typeof m.content === 'string' && m.content.trim() !== ''
     )
     .map((m) => ({ role: m.role, content: m.content }))
-    .slice(-MAX_HISTORY)
 }
 
 function pageIdOf(wc: WebContents): number | undefined {
@@ -218,7 +226,7 @@ function shortcutFor(input: Input): Shortcut | null {
 // Shortcuts are caught in the main process so they work whether the app UI or a page has focus.
 function forwardShortcuts(wc: WebContents) {
   wc.on('before-input-event', (event, input) => {
-    // Without these, the default menu's Ctrl+W would close the window and Ctrl+R would reload the app UI.
+    // Ctrl+W and Ctrl+R are browser shortcuts (close, reload) that must never reach the app UI or a page.
     if ((input.control || input.meta) && /^[wr]$/i.test(input.key) && input.type === 'keyDown') {
       event.preventDefault()
       return
@@ -230,45 +238,55 @@ function forwardShortcuts(wc: WebContents) {
   })
 }
 
-function showContextMenu(wc: WebContents, params: Electron.ContextMenuParams) {
+// Only editing actions, plus (in web pages) what to do with a link or selected text. No browser
+// items such as Back, Reload or Inspect.
+function editingItems(params: Electron.ContextMenuParams): MenuItemConstructorOptions[] {
+  const flags = params.editFlags
+  if (params.isEditable) {
+    return [
+      { role: 'undo', enabled: flags.canUndo },
+      { role: 'redo', enabled: flags.canRedo },
+      { type: 'separator' },
+      { role: 'cut', enabled: flags.canCut },
+      { role: 'copy', enabled: flags.canCopy },
+      { role: 'paste', enabled: flags.canPaste },
+      { type: 'separator' },
+      { role: 'selectAll', enabled: flags.canSelectAll }
+    ]
+  }
+  return params.selectionText.trim() ? [{ role: 'copy' }] : []
+}
+
+function popupMenu(items: MenuItemConstructorOptions[]) {
+  while (items.at(-1)?.type === 'separator') items.pop()
+  if (items.length) Menu.buildFromTemplate(items).popup()
+}
+
+function showPageContextMenu(params: Electron.ContextMenuParams) {
   const items: MenuItemConstructorOptions[] = []
   if (params.linkURL) {
     items.push(
-      { label: 'Open link in system browser', click: () => shell.openExternal(params.linkURL) },
+      { label: 'Open link in system browser', click: () => openExternal(params.linkURL) },
       { label: 'Copy link address', click: () => clipboard.writeText(params.linkURL) },
       { type: 'separator' }
     )
   }
+  items.push(...editingItems(params))
   const selection = params.selectionText.trim()
   if (selection) {
     const short = selection.length > 30 ? `${selection.slice(0, 30)}…` : selection
-    items.push(
-      { role: 'copy' },
-      { label: `Search for “${short}”`, click: () => win?.webContents.send('page:search', selection) },
-      { type: 'separator' }
-    )
+    items.push({ label: `Search for “${short}”`, click: () => win?.webContents.send('page:search', selection) })
   }
-  if (params.isEditable) {
-    items.push({ role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }, { type: 'separator' })
-  }
-  items.push(
-    { label: 'Back', enabled: wc.navigationHistory.canGoBack(), click: () => wc.navigationHistory.goBack() },
-    { label: 'Forward', enabled: wc.navigationHistory.canGoForward(), click: () => wc.navigationHistory.goForward() },
-    { label: 'Reload', click: () => wc.reload() }
-  )
-  Menu.buildFromTemplate(items).popup()
+  popupMenu(items)
 }
 
 function createPage(id: number): Page {
   const view = new WebContentsView({
-    webPreferences: {
+    webPreferences: secureWebPreferences({
       partition: WEB_PARTITION,
-      sandbox: true,
-      contextIsolation: true,
-      nodeIntegration: false,
       // Catches plain link clicks so they open as a new popup; see src/preload/web.ts.
       preload: join(__dirname, '../preload/web.js')
-    }
+    })
   })
   const created: Page = { view, blocked: 0 }
   const wc = view.webContents
@@ -300,7 +318,7 @@ function createPage(id: number): Page {
     openLink(id, url)
     return { action: 'deny' }
   })
-  wc.on('context-menu', (_e, params) => showContextMenu(wc, params))
+  wc.on('context-menu', (_e, params) => showPageContextMenu(params))
   forwardShortcuts(wc)
 
   // It sits at the bottom of a popup with rounded corners.
@@ -330,7 +348,24 @@ function showPage(id: number | null) {
   }
 }
 
+// The UI is reloaded after a crash, but not endlessly if it keeps crashing.
+const MAX_UI_RELOADS = 3
+const UI_RELOAD_WINDOW = 5 * 60 * 1000
+let uiReloads: number[] = []
+
 function createWindow() {
+  // The built UI must still carry its strict Content-Security-Policy; a build without one isn't run.
+  const rendererHtml = join(__dirname, '../renderer/index.html')
+  if (!process.env.ELECTRON_RENDERER_URL) {
+    const problems = checkRendererCsp(rendererHtml)
+    if (problems.length) {
+      console.error(`Refusing to start: the UI's Content-Security-Policy is unsafe (${problems.join('; ')}).`)
+      dialog.showErrorBox('Zook can’t start', 'This build of Zook is damaged. Please reinstall it.')
+      app.quit()
+      return
+    }
+  }
+
   win = new BrowserWindow({
     width: 1280,
     height: 860,
@@ -339,20 +374,33 @@ function createWindow() {
     title: 'Zook',
     backgroundColor: '#ffffff',
     autoHideMenuBar: true,
-    webPreferences: {
-      preload: join(__dirname, '../preload/index.js'),
-      sandbox: true,
-      contextIsolation: true
-    }
+    webPreferences: secureWebPreferences({
+      preload: join(__dirname, '../preload/index.js')
+    })
   })
 
   // The app UI itself never navigates away; external links go to the system browser.
   win.webContents.on('will-navigate', (e) => e.preventDefault())
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url)
+    openExternal(url)
     return { action: 'deny' }
   })
   forwardShortcuts(win.webContents)
+  win.webContents.on('context-menu', (_e, params) => popupMenu(editingItems(params)))
+  // The crash itself is logged app-wide (see log.ts).
+  win.webContents.on('render-process-gone', (_e, details) => {
+    if (details.reason === 'clean-exit' || !win) return
+    const now = Date.now()
+    uiReloads = uiReloads.filter((t) => now - t < UI_RELOAD_WINDOW)
+    if (uiReloads.length >= MAX_UI_RELOADS) {
+      console.error('The UI keeps crashing; not reloading it again.')
+      return
+    }
+    uiReloads.push(now)
+    win.webContents.reload()
+  })
+  win.on('unresponsive', () => console.warn('The UI stopped responding.'))
+  win.on('responsive', () => console.warn('The UI is responding again.'))
   win.on('closed', () => {
     for (const controller of chats.values()) controller.abort()
     chats.clear()
@@ -364,7 +412,7 @@ function createWindow() {
   if (process.env.ELECTRON_RENDERER_URL) {
     win.loadURL(process.env.ELECTRON_RENDERER_URL)
   } else {
-    win.loadFile(join(__dirname, '../renderer/index.html'))
+    win.loadFile(rendererHtml)
   }
 }
 
@@ -413,28 +461,30 @@ ipcMain.handle('settings:clearSuggestKey', () => {
 })
 ipcMain.on('settings:setSidebar', (_e, open: boolean) => setSidebarOpen(open === true))
 
-ipcMain.handle(
-  'settings:saveChat',
-  async (_e, preset: ChatPresetId, baseUrl: string, model: string, apiKey: string) => {
-    const config = resolveChatConfig(preset, baseUrl, model, apiKey)
-    await verifyChatConfig(config)
-    saveChatConfig(config)
-    return getStatus()
-  }
+// A null id adds a new custom backend.
+ipcMain.handle('settings:saveChat', async (_e, id: string | null, form: ChatForm) => {
+  const config = resolveChatConfig(id, form)
+  await verifyChatConfig(config)
+  saveChatConfig(id, config)
+  return getStatus()
+})
+ipcMain.handle('settings:listChatModels', (_e, id: string | null, form: ChatForm) =>
+  listChatModels(resolveChatListConfig(id, form))
 )
-ipcMain.handle('settings:listChatModels', (_e, preset: ChatPresetId, baseUrl: string, apiKey: string) =>
-  listChatModels(resolveChatListConfig(preset, baseUrl, apiKey))
-)
+ipcMain.handle('settings:setActiveChat', (_e, id: string) => {
+  setActiveChat(id)
+  return getStatus()
+})
 ipcMain.handle('settings:setChatGrounded', (_e, grounded: boolean) => {
   setChatGrounded(grounded === true)
   return getStatus()
 })
-ipcMain.handle('settings:clearChat', () => {
-  clearChatConfig()
+ipcMain.handle('settings:clearChat', (_e, id: string) => {
+  clearChatConfig(String(id))
   return getStatus()
 })
 
-ipcMain.handle('chat:start', (e, messages: ChatMessage[], grounded: boolean, sessionId: unknown) => {
+ipcMain.handle('chat:start', (e, messages: ChatMessage[], grounded: boolean, sessionId: unknown, context: unknown) => {
   const config = getChatConfig()
   // An opaque per-conversation id from the renderer; anything else is dropped.
   const session = typeof sessionId === 'string' && /^[\w-]{1,100}$/.test(sessionId) ? sessionId : undefined
@@ -454,23 +504,47 @@ ipcMain.handle('chat:start', (e, messages: ChatMessage[], grounded: boolean, ses
     if (!wc.isDestroyed()) wc.send(channel, { requestId, ...payload })
   }
 
+  const research = startResearch(
+    cleanContext(context),
+    searchWeb && ((query) => searchWeb(query, 0)),
+    `Mozilla/5.0 (compatible; Zook/${app.getVersion()})`,
+    controller.signal,
+    (activity) => send('chat:activity', { activity }),
+    (pool) => send('chat:context', { context: pool })
+  )
+
   ;(async () => {
+    let reply = ''
+    const onDelta = (text: string) => {
+      reply += text
+      send('chat:delta', { text })
+    }
     try {
-      const system: ChatMessage[] = [{ role: 'system', content: SYSTEM_PROMPT }]
-      if (searchWeb) {
-        const { results } = await searchWeb(question.content.slice(0, 400), 0)
+      let finishReason: string
+      try {
+        finishReason = await runChat(
+          config,
+          buildMessages(history, research.context, { tools: true }),
+          research.tools,
+          controller.signal,
+          { onDelta, runTools: (calls) => research.runTools(calls) },
+          session
+        )
+      } catch (err) {
+        // Backends without tool support answer as before: one search up front, then the reply.
+        if (!(err instanceof ToolsUnsupportedError) || reply) throw err
+        const searched = searchWeb ? await research.searchFirst(question.content.slice(0, 400)) : undefined
         if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError')
-        const sources = results.slice(0, GROUNDING_RESULTS).map(toSource)
-        send('chat:sources', { sources })
-        system.push({ role: 'system', content: groundingPrompt(sources, results) })
+        finishReason = await runChat(
+          config,
+          buildMessages(history, research.context, { tools: false, searched }),
+          [],
+          controller.signal,
+          { onDelta, runTools: async () => [] },
+          session
+        )
       }
-      const finishReason = await streamChat(
-        config,
-        [...system, ...history],
-        controller.signal,
-        (text) => send('chat:delta', { text }),
-        session
-      )
+      send('chat:sources', { sources: sourcesFor(reply, research.context, research.added) })
       send('chat:done', { finishReason })
     } catch (err) {
       if (controller.signal.aborted) send('chat:done', { finishReason: 'aborted' })
@@ -510,8 +584,22 @@ ipcMain.handle('threads:rename', (_e, id: string, title: string) => renameThread
 ipcMain.handle('threads:delete', (_e, id: string) => deleteThread(id))
 
 // Opens a URL in a popup's page, creating the page for a new popup.
-ipcMain.on('page:open', (_e, id: unknown, url: string) => {
-  if (!win || !isPageId(id)) return
+ipcMain.handle('licenses:get', () => getNotices())
+ipcMain.handle('licenses:openChromium', () => openChromiumNotices())
+
+ipcMain.handle('updates:get', () => getUpdateStatus())
+ipcMain.handle('updates:check', () => checkForUpdates())
+ipcMain.handle('updates:download', () => downloadUpdate())
+ipcMain.on('updates:cancel', () => cancelDownload())
+ipcMain.handle('updates:install', () => installUpdate())
+ipcMain.handle('updates:setAuto', (_e, enabled: unknown) => {
+  setAutoUpdate(enabled === true)
+  rescheduleUpdates()
+  return getUpdateStatus()
+})
+
+ipcMain.on('page:open', (_e, id: unknown, url: unknown) => {
+  if (!win || !isPageId(id) || typeof url !== 'string' || !isWebUrl(url)) return
   const page = pages.get(id) ?? createPage(id)
   page.view.webContents.loadURL(url)
 })
@@ -523,7 +611,7 @@ ipcMain.on('page:show', (_e, id: unknown) => showPage(isPageId(id) ? id : null))
 ipcMain.on('page:close', (_e, id: unknown) => isPageId(id) && closePage(id))
 ipcMain.on('page:external', (_e, id: unknown) => {
   const page = isPageId(id) ? pages.get(id) : undefined
-  if (page) shell.openExternal(page.view.webContents.getURL())
+  if (page) openExternal(page.view.webContents.getURL())
 })
 // From the page preload: only pages Zook opened can ask, and only for web links.
 ipcMain.on('page:link', (e, url: unknown) => {
@@ -540,9 +628,29 @@ ipcMain.on('page:bounds', (_e, b: Bounds) => {
   if (shownPage !== null) pages.get(shownPage)?.view.setBounds(viewBounds)
 })
 
+// Only from the app's own UI, which reports its uncaught errors here.
+ipcMain.on('log:error', (e, message: unknown) => {
+  if (e.sender === win?.webContents) logRendererError(message)
+})
+ipcMain.handle('logs:open', async () => {
+  const error = await shell.openPath(logsDir())
+  if (error) throw new Error(error)
+})
+
+app.on('second-instance', () => {
+  if (!win) return createWindow()
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+})
+
 app.whenReady().then(() => {
+  if (!isPrimaryInstance) return
+  hardenSessions(WEB_PARTITION)
+  setAppMenu()
   setChatUserAgent(`Zook/${app.getVersion()}`)
   createWindow()
+  startUpdater({ getAuto: getAutoUpdate, onChange: (status) => win?.webContents.send('updates:state', status) })
   if (getAdblock()) {
     applyAdblock(true).catch((err) => console.error('Ad blocker failed to load:', err))
   }

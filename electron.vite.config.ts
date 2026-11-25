@@ -1,11 +1,16 @@
 import { resolve } from 'node:path'
 import { defineConfig } from 'electron-vite'
 import { svelte } from '@sveltejs/vite-plugin-svelte'
+// Records which packages end up in each bundle, for scripts/licenses.mjs.
+import { bundledPackages } from './scripts/licenses.mjs'
 
 export default defineConfig({
-  main: {},
+  main: {
+    plugins: [bundledPackages()]
+  },
   // `index` is the app's own preload; `web` runs in the web pages shown in popups.
   preload: {
+    plugins: [bundledPackages()],
     build: {
       rollupOptions: {
         input: {
@@ -16,6 +21,6 @@ export default defineConfig({
     }
   },
   renderer: {
-    plugins: [svelte()]
+    plugins: [svelte(), bundledPackages()]
   }
 })

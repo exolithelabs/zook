@@ -1,10 +1,12 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
-import type { ChatPresetId } from '../main/chat'
 import type { History } from '../main/history'
-import type { ChatSource, PageState, Shortcut } from '../main/index'
+import type { Notices } from '../main/licenses'
+import type { PageState, Shortcut } from '../main/index'
 import type { ProviderId, SearchResponse, Vertical } from '../main/providers'
-import type { SettingsStatus } from '../main/settings'
+import type { Activity, ChatContext, ChatSource } from '../main/research'
+import type { ChatForm, SettingsStatus } from '../main/settings'
 import type { ChatBackend, Thread, ThreadSummary } from '../main/threads'
+import type { UpdateStatus } from '../main/updater'
 
 function listen<T>(channel: string, cb: (value: T) => void) {
   const handler = (_e: IpcRendererEvent, value: T) => cb(value)
@@ -28,25 +30,31 @@ const api = {
     clearSuggestKey: (): Promise<SettingsStatus> => ipcRenderer.invoke('settings:clearSuggestKey'),
     setSidebar: (open: boolean) => ipcRenderer.send('settings:setSidebar', open),
     // The API key goes to main only; status reports back just its last four characters.
-    saveChat: (preset: ChatPresetId, baseUrl: string, model: string, apiKey: string): Promise<SettingsStatus> =>
-      ipcRenderer.invoke('settings:saveChat', preset, baseUrl, model, apiKey),
-    // A blank key uses the saved one, for the same base URL only.
-    listChatModels: (preset: ChatPresetId, baseUrl: string, apiKey: string): Promise<string[]> =>
-      ipcRenderer.invoke('settings:listChatModels', preset, baseUrl, apiKey),
-    clearChat: (): Promise<SettingsStatus> => ipcRenderer.invoke('settings:clearChat'),
+    // A null id adds a new custom backend.
+    saveChat: (id: string | null, form: ChatForm): Promise<SettingsStatus> =>
+      ipcRenderer.invoke('settings:saveChat', id, form),
+    // A blank key uses the backend's saved one, for the same base URL only.
+    listChatModels: (id: string | null, form: ChatForm): Promise<string[]> =>
+      ipcRenderer.invoke('settings:listChatModels', id, form),
+    setActiveChat: (id: string): Promise<SettingsStatus> => ipcRenderer.invoke('settings:setActiveChat', id),
+    clearChat: (id: string): Promise<SettingsStatus> => ipcRenderer.invoke('settings:clearChat', id),
     setChatGrounded: (grounded: boolean): Promise<SettingsStatus> =>
       ipcRenderer.invoke('settings:setChatGrounded', grounded)
   },
   chat: {
     // Resolves with a request id and the model answering; the reply arrives through the events below.
+    // `context` is what the chat has gathered so far; updates to it arrive as context events.
     start: (
       messages: { role: 'user' | 'assistant'; content: string }[],
       grounded: boolean,
-      sessionId: string
+      sessionId: string,
+      context: ChatContext
     ): Promise<{ requestId: string; backend: ChatBackend }> =>
-      ipcRenderer.invoke('chat:start', messages, grounded, sessionId),
+      ipcRenderer.invoke('chat:start', messages, grounded, sessionId, context),
     abort: (requestId: string): Promise<void> => ipcRenderer.invoke('chat:abort', requestId),
     onSources: (cb: (e: { requestId: string; sources: ChatSource[] }) => void) => listen('chat:sources', cb),
+    onActivity: (cb: (e: { requestId: string; activity: Activity }) => void) => listen('chat:activity', cb),
+    onContext: (cb: (e: { requestId: string; context: ChatContext }) => void) => listen('chat:context', cb),
     onDelta: (cb: (e: { requestId: string; text: string }) => void) => listen('chat:delta', cb),
     onDone: (cb: (e: { requestId: string; finishReason: string }) => void) => listen('chat:done', cb),
     onError: (cb: (e: { requestId: string; message: string }) => void) => listen('chat:error', cb)
@@ -70,6 +78,22 @@ const api = {
     rename: (id: string, title: string): Promise<ThreadSummary[]> => ipcRenderer.invoke('threads:rename', id, title),
     delete: (id: string): Promise<ThreadSummary[]> => ipcRenderer.invoke('threads:delete', id)
   },
+  licenses: {
+    get: (): Promise<Notices> => ipcRenderer.invoke('licenses:get'),
+    // Chromium's, Node.js's and the rest of Electron's notices, in the system browser.
+    openChromium: (): Promise<void> => ipcRenderer.invoke('licenses:openChromium')
+  },
+  // Signed releases from GitHub. Each call resolves with the status as it stands afterwards.
+  updates: {
+    get: (): Promise<UpdateStatus> => ipcRenderer.invoke('updates:get'),
+    check: (): Promise<UpdateStatus> => ipcRenderer.invoke('updates:check'),
+    download: (): Promise<UpdateStatus> => ipcRenderer.invoke('updates:download'),
+    cancel: () => ipcRenderer.send('updates:cancel'),
+    // Restarts into the new AppImage, or opens the downloaded installer and quits.
+    install: (): Promise<UpdateStatus> => ipcRenderer.invoke('updates:install'),
+    setAuto: (enabled: boolean): Promise<UpdateStatus> => ipcRenderer.invoke('updates:setAuto', enabled),
+    onState: (cb: (status: UpdateStatus) => void) => listen('updates:state', cb)
+  },
   // Each popup is numbered by the renderer; only the top one's page is shown.
   page: {
     open: (id: number, url: string) => ipcRenderer.send('page:open', id, url),
@@ -84,7 +108,12 @@ const api = {
     // A link followed in the popup `from`, to open as a new popup on top.
     onLink: (cb: (link: { from: number; url: string }) => void) => listen('page:link', cb)
   },
-  onShortcut: (cb: (shortcut: Shortcut) => void) => listen('shortcut', cb)
+  onShortcut: (cb: (shortcut: Shortcut) => void) => listen('shortcut', cb),
+  logs: {
+    // Uncaught errors in the UI, for main.log.
+    error: (message: string) => ipcRenderer.send('log:error', message),
+    open: (): Promise<void> => ipcRenderer.invoke('logs:open')
+  }
 }
 
 export type ZookApi = typeof api
