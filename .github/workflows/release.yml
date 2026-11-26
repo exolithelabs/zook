@@ -3,8 +3,9 @@ name: Release
 # Tag v<package.json version>. Builds each installer on its own OS, then signs one
 # release.json for all of them and publishes it to exolithelabs/zook.
 #
-# Secret ZOOK_RELEASE_KEY is the PKCS#8 PEM from `npm run release:keygen`. The matching
-# public key must already be committed in src/main/update-key.ts.
+# Secret ZOOK_RELEASE_KEY is the PKCS#8 PEM from `npm run release:keygen`, stored on
+# the protected `release` environment. The matching public key must already be
+# committed in src/main/update-key.ts.
 
 on:
   push:
@@ -77,6 +78,7 @@ jobs:
     name: Sign and publish
     needs: build
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 20
     permissions:
       contents: write

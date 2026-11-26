@@ -114,9 +114,9 @@ Releases are built and published by the **Release** workflow (`.github/workflows
    npm run release:keygen
    ```
    The private key is written to `~/.config/zook-release/ed25519.pem`, or to `$ZOOK_RELEASE_KEY` if that is set. The public key is written into `src/main/update-key.ts`; commit that file. Back up the private key and never commit it. If you lose it, installed copies can't trust new releases.
-2. Add the private key's full PEM text as a repository secret named `ZOOK_RELEASE_KEY`:
+2. Add the private key's full PEM text as the `ZOOK_RELEASE_KEY` secret on the `release` environment. That environment is limited to `v*` tags and requires a reviewer before `publish` runs:
    ```sh
-   gh secret set ZOOK_RELEASE_KEY < ~/.config/zook-release/ed25519.pem
+   gh secret set ZOOK_RELEASE_KEY --env release < ~/.config/zook-release/ed25519.pem
    ```
 
 **Each release:**
@@ -131,7 +131,7 @@ Releases are built and published by the **Release** workflow (`.github/workflows
 The workflow then does the following:
 
 1. **Build.** It runs `npm run dist` on Ubuntu, macOS and Windows at the same time. If the tag doesn't match `package.json`'s version, it fails.
-2. **Sign.** It gathers every build, fails if the AppImage, `.dmg`, `.zip` or `.exe` is missing, and signs `release.json` with the `ZOOK_RELEASE_KEY` secret.
+2. **Sign.** The `publish` job waits for the `release` environment, gathers every build, fails if the AppImage, `.dmg`, `.zip` or `.exe` is missing, and signs `release.json` with the `ZOOK_RELEASE_KEY` environment secret.
 3. **Publish.** It creates the GitHub release `v<version>` on `exolithelabs/zook` and uploads the builds, `release.json` and `release.json.sig`.
 
 A version with a hyphen, such as `0.2.0-beta.1`, is published as a prerelease. The app only looks at the latest normal release, so installed copies won't be offered a prerelease.
